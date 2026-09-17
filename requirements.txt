@@ -9,3 +9,5 @@ certifi==2024.2.2
 charset-normalizer==3.3.2
 idna==3.6
 tqdm
+fastapi>=0.115,<1
+uvicorn>=0.30,<1

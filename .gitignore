@@ -6,6 +6,8 @@ __pycache__/
 # 虛擬環境
 /jable
 venv/
+.venv/
+.env
 env/
 
 # 影片與暫存檔
@@ -23,3 +25,8 @@ chromedriver*
 
 # 下載資料夾（影片可能很大）
 downloads/
+
+# 管理后台构建产物
+/admin-ui/node_modules/
+/admin-ui/dist/
+*.tsbuildinfo

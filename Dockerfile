@@ -1,3 +1,10 @@
+FROM node:24-alpine AS admin-build
+WORKDIR /admin
+COPY admin-ui/package*.json ./
+RUN npm ci
+COPY admin-ui ./
+RUN npm run build
+
 # ---- Base Image ----
 # 使用輕量的 Python 3.11 映像檔
 FROM python:3.11-slim
@@ -25,6 +32,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # ---- 複製專案程式碼 ----
 COPY . .
+COPY --from=admin-build /admin/dist /app/admin-ui/dist
 
 # ---- 掛載點 ----
 # 下載的影片會存放到 /downloads，可透過 -v 掛載到本機

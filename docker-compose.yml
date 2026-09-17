@@ -1,6 +1,21 @@
-version: '3.8'
-
 services:
+  api:
+    build: .
+    image: jable-downloader:latest
+    command: ["python", "-m", "uvicorn", "api:app", "--app-dir", "/app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    environment:
+      JABLE_API_KEY: ${JABLE_API_KEY:-}
+      JABLE_TIMEOUT: ${JABLE_TIMEOUT:-30}
+      DOWNLOAD_DIR: /downloads
+      DATABASE_PATH: /data/tasks.sqlite3
+    volumes:
+      - ./downloads:/downloads
+      - api_data_v2:/data
+    stop_grace_period: 50s
+    restart: unless-stopped
+
   # ---- 主下載服務 ----
   downloader:
     build: .
@@ -25,4 +40,5 @@ services:
     restart: unless-stopped
 
 volumes:
+  api_data_v2:
   redis_data:

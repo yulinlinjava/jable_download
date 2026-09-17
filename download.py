@@ -11,6 +11,7 @@ from encode import ffmpegEncode
 from delete import deleteM3u8, deleteMp4
 from cover import getCover
 from args import *
+from video_data import extract_m3u8
 
 def download(url):
 
@@ -28,9 +29,10 @@ def download(url):
   #配置Selenium參數
   dr = initWebDriver()
   dr.get(url)
-  result = re.search("https://.+m3u8", dr.page_source)
-  print(f'result: {result}')
-  m3u8url = result[0]
+  m3u8url = extract_m3u8(dr.page_source)
+  if not m3u8url:
+    dr.quit()
+    raise ValueError('未解析到 m3u8 播放地址')
   print(f'm3u8url: {m3u8url}')
 
   # 得到 m3u8 網址

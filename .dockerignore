@@ -13,10 +13,14 @@ __pycache__/
 # 虛擬環境（不要打包進 image）
 jable/
 venv/
+.venv/
+.env
 env/
 
 # 下載的影片（可能很大）
 downloads/
+admin-ui/node_modules/
+admin-ui/dist/
 *.mp4
 *.ts
 *.m3u8
