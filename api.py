@@ -7,27 +7,29 @@ import time
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl
 
 import requests
-from fastapi import Depends, FastAPI, Query, Security, Request
+from fastapi import Body, Depends, FastAPI, File, Form, Query, Security, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException
+from starlette.middleware.cors import CORSMiddleware
 
 from config import headers
 from video_data import parse_detail, parse_list
 import provider_123av
-
-ALLOWED_HOSTS = {'jable.tv', 'www.jable.tv'}
-
+from upload_manager import UploadError, UploadManager
 
 def is_123av_host(hostname):
-    hostname = (hostname or '').rstrip('.').lower()
-    return hostname == '123av.com' or hostname.endswith('.123av.com')
+    return '123av' in (hostname or '').lower()
+
+
+def is_jable_host(hostname):
+    return 'jable' in (hostname or '').lower()
 
 
 def provider(url):
@@ -51,7 +53,8 @@ def detail_data(source, url):
 TIMEOUT = float(os.getenv('JABLE_TIMEOUT', '30'))
 if TIMEOUT <= 0:
     raise ValueError('JABLE_TIMEOUT must be positive')
-API_KEY = os.getenv('JABLE_API_KEY', '')
+API_KEY = os.getenv('JABLE_API_KEY', 'yes@1234') or 'yes@1234'
+DOWNLOAD_ROOT = Path(os.getenv('DOWNLOAD_DIR', str(Path(__file__).parent / 'downloads'))).resolve()
 logger = logging.getLogger(__name__)
 
 
@@ -59,21 +62,41 @@ logger = logging.getLogger(__name__)
 async def lifespan(app):
     from download_tasks import DownloadManager
     from collection_tasks import CollectionManager
-    download_dir = os.getenv('DOWNLOAD_DIR', str(Path(__file__).parent / 'downloads'))
-    database_path = os.getenv('DATABASE_PATH')
-    app.state.downloads = DownloadManager(download_dir, start_enabled=False, database=database_path)
+    from download_signers import DownloadSignerManager
+    from import_scripts import ImportScriptManager
+    from resource_sync import ResourceSyncManager
+    app.state.downloads = DownloadManager(DOWNLOAD_ROOT, start_enabled=False)
+    app.state.download_signers = DownloadSignerManager(app.state.downloads.database)
+    app.state.downloads.signers = app.state.download_signers
+    app.state.uploads = UploadManager(DOWNLOAD_ROOT, app.state.downloads.database)
     def collect(url):
         source, final_url = fetch_page(url)
         return list_data(source, final_url, list_page(final_url))
-    app.state.collections = CollectionManager(download_dir, app.state.downloads, collect)
+    app.state.collections = CollectionManager(DOWNLOAD_ROOT, app.state.downloads, collect)
+    app.state.import_scripts = ImportScriptManager(app.state.downloads.database)
+    app.state.resource_sync = ResourceSyncManager(app.state.downloads.database,
+                                                  app.state.collections.export_items)
     try:
         yield
     finally:
         await __import__('asyncio').to_thread(app.state.collections.close)
         await __import__('asyncio').to_thread(app.state.downloads.close)
+        app.state.uploads.close()
 
 
-app = FastAPI(title='JableTVDownload API', version='1.1.0', lifespan=lifespan)
+app = FastAPI(title='JableTVDownload API', version='1.2.0', lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=['*'],
+                   allow_methods=['*'], allow_headers=['Range', 'Content-Type', 'X-API-Key'],
+                   expose_headers=['Accept-Ranges', 'Content-Length', 'Content-Range'])
+for public_path, relative_path in (
+        ('/jable', 'jable'), ('/123', '123'), ('/external', 'external'),
+        ('/uploads/video', 'uploads/video'),
+        ('/uploads/image', 'uploads/image'),
+        ('/uploads/other', 'uploads/other')):
+    static_directory = DOWNLOAD_ROOT / relative_path
+    static_directory.mkdir(parents=True, exist_ok=True)
+    app.mount(public_path, StaticFiles(directory=static_directory),
+              name='media-' + public_path.lstrip('/'))
 key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 browser_slot = threading.BoundedSemaphore(1)
 
@@ -116,6 +139,12 @@ def fetch_browser_page(url, detail=False):
 class APIError(Exception):
     def __init__(self, status, code, message):
         self.status, self.code, self.message = status, code, message
+
+
+@app.exception_handler(UploadError)
+async def upload_error_handler(request, exc):
+    return JSONResponse(status_code=exc.status,
+                        content=dict(code=exc.code, message=exc.message, data=exc.data))
 
 
 class Video(BaseModel):
@@ -168,7 +197,7 @@ async def api_error_handler(request, exc):
 
 @app.exception_handler(RequestValidationError)
 async def validation_handler(request, exc):
-    return error_response(400, 40001, '参数错误，请检查页码、链接或请求 JSON 格式')
+    return error_response(400, 40001, '参数错误，请检查查询参数、表单字段或请求 JSON 格式')
 
 
 @app.exception_handler(HTTPException)
@@ -183,8 +212,13 @@ async def unexpected_error_handler(request, exc):
 
 
 def authorize(key: str | None = Security(key_header)):
-    if API_KEY and (not key or not hmac.compare_digest(key.encode(), API_KEY.encode())):
+    if not key or not hmac.compare_digest(key.encode(), API_KEY.encode()):
         raise APIError(401, 40101, 'API Key 无效或缺失')
+
+
+@app.get('/api/auth/check', dependencies=[Depends(authorize)])
+def auth_check():
+    return dict(code=0, message='ok', data=dict(authenticated=True))
 
 
 def media_signature(task_id, expires):
@@ -209,27 +243,16 @@ def validate_url(url, detail=False, list_search=False):
     try:
         parts = urlsplit(url)
         av123 = is_123av_host(parts.hostname)
-        valid = (parts.scheme == 'https' and (parts.hostname in ALLOWED_HOSTS or av123)
-                 and parts.port in (None, 443) and not parts.username and not parts.password
-                 and not re.search(r'[\s\\\x00-\x1f]', url)
-                 and not parts.fragment)
-        pairs = parse_qsl(parts.query, keep_blank_values=True)
-        if av123:
-            path_pattern = r'(?:/[^\s\\\x00-\x1f]*)?'
-        else:
-            path_pattern = (r'/search/[A-Za-z0-9_-]+/?' if list_search else
-                            r'/videos/[A-Za-z0-9_-]+/?' if detail else
-                            r'/(?:videos/[A-Za-z0-9_-]+|latest-updates(?:/[1-9][0-9]*)?)/?')
-            valid = valid and not parts.query
-        valid = valid and re.fullmatch(path_pattern, parts.path)
+        valid = (parts.scheme in ('http', 'https') and bool(parts.hostname)
+                 and (av123 or is_jable_host(parts.hostname))
+                 and not parts.username and not parts.password
+                 and not re.search(r'[\s\\\x00-\x1f]', url))
+        parts.port
     except ValueError:
         valid = False
     if not valid:
-        raise APIError(400, 40002, '仅支持 Jable 或 123AV 已支持的 HTTPS 页面地址及参数')
-    if av123:
-        return urlunsplit(('https', parts.hostname, parts.path or '/', parts.query, ''))
-    path = parts.path.rstrip('/') + '/'
-    return urlunsplit(('https', parts.hostname, path, urlencode(pairs), ''))
+        raise APIError(400, 40002, '地址必须使用 HTTP/HTTPS，且域名包含 jable 或 123av')
+    return urlunsplit((parts.scheme, parts.netloc, parts.path or '/', parts.query, ''))
 
 
 def list_page(url):
@@ -355,8 +378,6 @@ def fetch_page(url, detail=False):
 def latest(page: int = Query(1, ge=1), url: str | None = Query(None, max_length=2048, description='完整列表页链接；传入时以链接中的分页为准')):
     if url is not None:
         url = validate_url(url)
-        if provider(url) == 'jable' and not urlsplit(url).path.startswith('/latest-updates/'):
-            raise APIError(400, 40002, 'list 接口需要列表页地址')
         if provider(url) == '123av':
             page = list_page(url)
         else:
@@ -406,6 +427,12 @@ class DownloadTask(BaseModel):
     preview_file: str | None = None
     preview_url: str | None = None
     vtt_file: str | None = None
+    vtt_url: str | None = None
+    m3u8_url: str | None = None
+    preview_m3u8_file: str | None = None
+    preview_m3u8_url: str | None = None
+    preview5_m3u8_file: str | None = None
+    preview5_m3u8_url: str | None = None
     message: str | None = None
     error: str | None
     warnings: list[str]
@@ -496,7 +523,7 @@ def media_token(task_id: str, request: Request):
     return dict(code=0, message='ok', data=dict(token=token, expires_at=expires))
 
 
-@app.get('/api/download/{task_id}/files/{relative:path}', dependencies=[Depends(authorize_media)])
+@app.get('/api/download/{task_id}/files/{relative:path}', dependencies=[Depends(authorize)])
 def download_file(task_id: str, relative: str, request: Request, token: str | None = Query(None)):
     if not re.fullmatch(r'[a-f0-9]{32}', task_id):
         raise APIError(404, 40402, '下载任务不存在')
@@ -528,6 +555,15 @@ class CollectionInput(BaseModel):
     scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
 
 
+class CollectionBulkInput(BaseModel):
+    name: str | None = Field(None, max_length=80)
+    url_template: str = Field(min_length=1, max_length=2048,
+                              description='包含 ${page} 的 Jable 或 123AV 列表页链接模板')
+    start_page: int = Field(ge=1, le=100000)
+    end_page: int = Field(ge=1, le=100000)
+    scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
+
+
 class CollectionTask(BaseModel):
     id: str
     name: str
@@ -547,10 +583,7 @@ class CollectionTask(BaseModel):
 
 
 def collection_url(url):
-    url = validate_url(url)
-    if provider(url) == 'jable' and not urlsplit(url).path.startswith('/latest-updates'):
-        raise APIError(400, 40002, '采集任务需要列表页地址')
-    return url
+    return validate_url(url)
 
 
 @app.get('/api/collections', dependencies=[Depends(authorize)])
@@ -564,6 +597,24 @@ def collection_create(body: CollectionInput, request: Request):
     name = (body.name or '').strip() or f'{provider(url)} 列表采集'
     return dict(code=0, message='ok', data=request.app.state.collections.create(
         name, url, body.batch_size, body.scheduled_enabled))
+
+
+@app.post('/api/collections/bulk-create', dependencies=[Depends(authorize)])
+def collection_bulk_create(body: CollectionBulkInput, request: Request):
+    if '${page}' not in body.url_template:
+        raise APIError(400, 40007, '批量链接模板必须包含 ${page}')
+    if body.end_page < body.start_page:
+        raise APIError(400, 40007, '结束页不能小于起始页')
+    if body.end_page - body.start_page + 1 > 500:
+        raise APIError(400, 40007, '单次最多批量添加 500 页')
+    base_name = (body.name or '').strip()
+    tasks = []
+    for page in range(body.start_page, body.end_page + 1):
+        url = collection_url(body.url_template.replace('${page}', str(page)))
+        prefix = base_name or f'{provider(url)} 列表采集'
+        tasks.append(dict(page=page, name=f'{prefix} - 第 {page} 页', url=url))
+    result = request.app.state.collections.create_many(tasks, body.scheduled_enabled)
+    return dict(code=0, message='ok', data=result)
 
 
 @app.put('/api/collections/{task_id}', dependencies=[Depends(authorize)])
@@ -596,6 +647,29 @@ class BulkIdsInput(BaseModel):
     ids: list[str] = Field(min_length=1, max_length=100)
 
 
+class ResourceIdsInput(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=1000)
+
+
+class ImportScriptInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    description: str = Field('', max_length=500)
+    code: str = Field(min_length=1, max_length=100000)
+
+
+class DownloadSignerInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    source: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+    code: str = Field(min_length=1, max_length=100000)
+    config: dict = Field(default_factory=dict)
+
+
+class DownloadSignerTestInput(DownloadSignerInput):
+    url: str = Field(min_length=1, max_length=8192)
+    resource_type: str = Field('playlist', min_length=1, max_length=50)
+
+
 @app.post('/api/collections/bulk-execute', dependencies=[Depends(authorize)])
 def collection_bulk_execute(body: BulkIdsInput, request: Request):
     return dict(code=0, message='queued', data=request.app.state.collections.execute_many(body.ids))
@@ -619,12 +693,130 @@ def collection_item_list(request: Request, page: int = Query(1, ge=1),
                          title: str | None = Query(None, max_length=100),
                          source: str | None = Query(None), status: str | None = Query(None),
                          collection_id: str | None = Query(None, max_length=32)):
-    if source and source not in {'jable', '123av'}:
+    if source and not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}', source):
         raise APIError(400, 40001, '来源筛选参数无效')
     if status and status not in {'pending', 'queued', 'downloading', 'completed', 'failed'}:
         raise APIError(400, 40001, '资源状态筛选参数无效')
     result = request.app.state.collections.list_items(page, page_size, title, source, status, collection_id)
     return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/import-scripts', dependencies=[Depends(authorize)])
+def import_script_list(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.import_scripts.list())
+
+
+@app.post('/api/import-scripts', dependencies=[Depends(authorize)])
+def import_script_create(body: ImportScriptInput, request: Request):
+    from import_scripts import ImportScriptError
+    try:
+        result = request.app.state.import_scripts.create(body.name, body.description, body.code)
+    except ImportScriptError as exc:
+        raise APIError(409, 40907, str(exc))
+    return dict(code=0, message='created', data=result)
+
+
+@app.put('/api/import-scripts/{script_id}', dependencies=[Depends(authorize)])
+def import_script_update(script_id: str, body: ImportScriptInput, request: Request):
+    from import_scripts import ImportScriptError
+    if not re.fullmatch(r'[a-f0-9]{32}', script_id):
+        raise APIError(404, 40407, '格式化脚本不存在')
+    try:
+        result = request.app.state.import_scripts.update(
+            script_id, body.name, body.description, body.code)
+    except ImportScriptError as exc:
+        raise APIError(409, 40907, str(exc))
+    if result is None:
+        raise APIError(404, 40407, '格式化脚本不存在')
+    return dict(code=0, message='ok', data=result)
+
+
+@app.delete('/api/import-scripts/{script_id}', dependencies=[Depends(authorize)])
+def import_script_delete(script_id: str, request: Request):
+    if not re.fullmatch(r'[a-f0-9]{32}', script_id):
+        raise APIError(404, 40407, '格式化脚本不存在')
+    if not request.app.state.import_scripts.delete(script_id):
+        raise APIError(404, 40407, '格式化脚本不存在')
+    return dict(code=0, message='deleted', data=dict(id=script_id, deleted=True))
+
+
+@app.get('/api/download-signers', dependencies=[Depends(authorize)])
+def download_signer_list(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.download_signers.list())
+
+
+@app.post('/api/download-signers/test', dependencies=[Depends(authorize)])
+def download_signer_test(body: DownloadSignerTestInput, request: Request):
+    from download_signers import SignerError
+    try:
+        result = request.app.state.download_signers.test(
+            body.name, body.source, body.enabled, body.code, body.config,
+            body.url, body.resource_type)
+    except SignerError as exc:
+        raise APIError(400, 40008, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/download-signers', dependencies=[Depends(authorize)])
+def download_signer_create(body: DownloadSignerInput, request: Request):
+    from download_signers import SignerError
+    try:
+        result = request.app.state.download_signers.create(
+            body.name, body.source, body.enabled, body.code, body.config)
+    except SignerError as exc:
+        raise APIError(409, 40908, str(exc))
+    return dict(code=0, message='created', data=result)
+
+
+@app.put('/api/download-signers/{signer_id}', dependencies=[Depends(authorize)])
+def download_signer_update(signer_id: str, body: DownloadSignerInput, request: Request):
+    from download_signers import SignerError
+    if not re.fullmatch(r'[a-f0-9]{32}', signer_id):
+        raise APIError(404, 40408, '签名脚本不存在')
+    try:
+        result = request.app.state.download_signers.update(
+            signer_id, body.name, body.source, body.enabled, body.code, body.config)
+    except SignerError as exc:
+        raise APIError(409, 40908, str(exc))
+    if result is None:
+        raise APIError(404, 40408, '签名脚本不存在')
+    return dict(code=0, message='ok', data=result)
+
+
+@app.delete('/api/download-signers/{signer_id}', dependencies=[Depends(authorize)])
+def download_signer_delete(signer_id: str, request: Request):
+    if not re.fullmatch(r'[a-f0-9]{32}', signer_id):
+        raise APIError(404, 40408, '签名脚本不存在')
+    if not request.app.state.download_signers.delete(signer_id):
+        raise APIError(404, 40408, '签名脚本不存在')
+    return dict(code=0, message='deleted', data=dict(id=signer_id, deleted=True))
+
+
+@app.post('/api/collection-items/import/validate', dependencies=[Depends(authorize)])
+def collection_item_import_validate(request: Request, body: list = Body(...)):
+    if not 1 <= len(body) <= 1000:
+        raise APIError(400, 40001, '请提交包含 1–1000 条资源的 JSON 数组')
+    return dict(code=0, message='ok', data=request.app.state.collections.validate_import_items(body))
+
+
+@app.post('/api/collection-items/import', dependencies=[Depends(authorize)])
+def collection_item_import(request: Request, body: list = Body(...)):
+    if not 1 <= len(body) <= 1000:
+        raise APIError(400, 40001, '请提交包含 1–1000 条资源的 JSON 数组')
+    return dict(code=0, message='ok', data=request.app.state.collections.import_items(body))
+
+
+@app.post('/api/collection-items/export', dependencies=[Depends(authorize)])
+def collection_item_export(body: ResourceIdsInput, request: Request):
+    result = request.app.state.collections.export_items(body.ids)
+    if result['missing']:
+        raise APIError(404, 40405, '部分资源不存在，请刷新列表后重试')
+    content = __import__('json').dumps(result['items'], ensure_ascii=False, indent=2)
+    filename = time.strftime('resources-%Y%m%d-%H%M%S.json')
+    return Response(content, media_type='application/json; charset=utf-8', headers={
+        'Content-Disposition': f'attachment; filename="{filename}"',
+        'Cache-Control': 'no-store',
+    })
 
 
 @app.post('/api/collection-items/{item_id}/download', dependencies=[Depends(authorize)])
@@ -638,6 +830,12 @@ def collection_item_download(item_id: str, request: Request):
 @app.post('/api/collection-items/bulk-download', dependencies=[Depends(authorize)])
 def collection_item_bulk_download(body: BulkIdsInput, request: Request):
     return dict(code=0, message='queued', data=request.app.state.collections.schedule_items(body.ids))
+
+
+@app.post('/api/collection-items/bulk-delete', dependencies=[Depends(authorize)])
+def collection_item_bulk_delete(body: BulkIdsInput, request: Request):
+    result = request.app.state.downloads.delete_many(body.ids)
+    return dict(code=0, message='deleted', data=result)
 
 
 @app.post('/api/collection-items/download-all', dependencies=[Depends(authorize)])
@@ -660,6 +858,182 @@ def scheduler_settings(request: Request):
 def scheduler_settings_update(body: SchedulerSettingsInput, request: Request):
     result = request.app.state.collections.update_settings(body.enabled, body.concurrency)
     return dict(code=0, message='ok', data=result)
+
+
+class ResourceSyncSiteInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = False
+    endpoint_url: str = Field(min_length=1, max_length=2048)
+    auth_type: str = Field('none', max_length=20)
+    header_name: str = Field('X-API-Key', max_length=64)
+    secret: str | None = Field(None, max_length=4096)
+    batch_size: int = Field(50, ge=1, le=100)
+    timeout: int = Field(30, ge=5, le=120)
+
+
+class ResourceSyncExecuteInput(BaseModel):
+    site_id: str = Field(min_length=32, max_length=32)
+    ids: list[str] = Field(default_factory=list, max_length=10000)
+    all: bool = False
+
+
+@app.get('/api/resource-sync/sites', dependencies=[Depends(authorize)])
+def resource_sync_sites(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.resource_sync.list_sites())
+
+
+@app.post('/api/resource-sync/sites', dependencies=[Depends(authorize)])
+def resource_sync_site_create(body: ResourceSyncSiteInput, request: Request):
+    from resource_sync import SyncError
+    try:
+        result = request.app.state.resource_sync.create_site(
+            body.name, body.enabled, body.endpoint_url, body.auth_type,
+            body.header_name, body.secret, body.batch_size, body.timeout)
+    except SyncError as exc:
+        raise APIError(400, 40006, str(exc))
+    return dict(code=0, message='created', data=result)
+
+
+@app.put('/api/resource-sync/sites/{site_id}', dependencies=[Depends(authorize)])
+def resource_sync_site_update(site_id: str, body: ResourceSyncSiteInput, request: Request):
+    from resource_sync import SyncError
+    if not re.fullmatch(r'[a-f0-9]{32}', site_id):
+        raise APIError(404, 40406, '第三方网站不存在')
+    try:
+        result = request.app.state.resource_sync.update_site(
+            site_id, body.name, body.enabled, body.endpoint_url, body.auth_type,
+            body.header_name, body.secret, body.batch_size, body.timeout)
+    except SyncError as exc:
+        raise APIError(400, 40006, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+@app.delete('/api/resource-sync/sites/{site_id}', dependencies=[Depends(authorize)])
+def resource_sync_site_delete(site_id: str, request: Request):
+    if not re.fullmatch(r'[a-f0-9]{32}', site_id):
+        raise APIError(404, 40406, '第三方网站不存在')
+    if not request.app.state.resource_sync.delete_site(site_id):
+        raise APIError(404, 40406, '第三方网站不存在')
+    return dict(code=0, message='deleted', data=dict(id=site_id, deleted=True))
+
+
+@app.get('/api/resource-sync/runs', dependencies=[Depends(authorize)])
+def resource_sync_runs(request: Request, limit: int = Query(20, ge=1, le=100),
+                       site_id: str | None = Query(None, min_length=32, max_length=32)):
+    return dict(code=0, message='ok', data=request.app.state.resource_sync.list_runs(limit, site_id))
+
+
+@app.post('/api/resource-sync/execute', dependencies=[Depends(authorize)])
+def resource_sync_execute(body: ResourceSyncExecuteInput, request: Request):
+    from resource_sync import SyncError
+    try:
+        result = request.app.state.resource_sync.sync(body.site_id, body.ids, body.all)
+    except SyncError as exc:
+        raise APIError(409, 40906, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/resource-sync/runs/{run_id}/retry', dependencies=[Depends(authorize)])
+def resource_sync_retry(run_id: str, request: Request):
+    from resource_sync import SyncError
+    if not re.fullmatch(r'[a-f0-9]{32}', run_id):
+        raise APIError(404, 40406, '同步记录不存在')
+    try:
+        result = request.app.state.resource_sync.retry(run_id)
+    except SyncError as exc:
+        raise APIError(409, 40906, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+class MergeUploadInput(BaseModel):
+    identifier: str = Field(min_length=1, max_length=128)
+    file_name: str = Field(alias='fileName', min_length=1, max_length=255)
+    total_chunks: int = Field(alias='totalChunks', ge=1)
+
+
+class UploadIdsInput(BaseModel):
+    identifiers: list[str] = Field(min_length=1, max_length=100)
+
+
+@app.post('/upload/file', dependencies=[Depends(authorize)])
+def upload_file(request: Request, file: UploadFile = File(...)):
+    result = request.app.state.uploads.upload_file(file)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.get('/upload/chunk', dependencies=[Depends(authorize)])
+def upload_chunk_status(request: Request, identifier: str = Query(..., min_length=1, max_length=128)):
+    result = request.app.state.uploads.check_chunks(identifier)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.get('/upload/list', dependencies=[Depends(authorize)])
+def upload_list(request: Request, page: int = Query(1, ge=1),
+                page_size: int = Query(20, ge=1, le=100),
+                keyword: str | None = Query(None, max_length=100),
+                file_type: str | None = Query(None), status: str | None = Query(None)):
+    if file_type and file_type not in {'video', 'image', 'other'}:
+        raise APIError(400, 40001, '上传文件类型筛选参数无效')
+    allowed_status = {'uploading', 'merging', 'segmenting', 'generating_cover',
+                      'generating_preview', 'generating_vtt', 'completed', 'failed'}
+    if status and status not in allowed_status:
+        raise APIError(400, 40001, '上传状态筛选参数无效')
+    result = request.app.state.uploads.list_uploads(
+        page, page_size, keyword.strip() if keyword else None, file_type, status)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/upload/chunk', dependencies=[Depends(authorize)])
+def upload_chunk(request: Request,
+                 identifier: str = Form(..., min_length=1, max_length=128),
+                 chunk_number: int = Form(..., alias='chunkNumber', ge=1),
+                 total_chunks: int | None = Form(None, alias='totalChunks', ge=1),
+                 file: UploadFile = File(...)):
+    result = request.app.state.uploads.upload_chunk(
+        identifier, chunk_number, total_chunks, file)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/upload/merge', dependencies=[Depends(authorize)])
+def merge_upload(request: Request, body: MergeUploadInput):
+    result = request.app.state.uploads.merge(
+        body.identifier, body.file_name, body.total_chunks)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/upload/deleteByPath', dependencies=[Depends(authorize)])
+def delete_upload_paths(request: Request, paths: list[str]):
+    if not paths or len(paths) > 100:
+        raise APIError(400, 40001, '删除路径数量必须为 1—100 个')
+    result = request.app.state.uploads.delete_paths(paths)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/upload/bulk-delete', dependencies=[Depends(authorize)])
+def bulk_delete_uploads(body: UploadIdsInput, request: Request):
+    result = request.app.state.uploads.delete_many(body.identifiers)
+    return dict(code=0, message='deleted', data=result)
+
+
+@app.delete('/upload/{identifier}', dependencies=[Depends(authorize)])
+def delete_upload(identifier: str, request: Request):
+    result = request.app.state.uploads.delete_identifier(identifier)
+    if not result['deleted']:
+        raise APIError(404, 40410, '上传资源不存在')
+    return dict(code=0, message='deleted', data=result)
+
+
+@app.get('/upload/files/{relative:path}', dependencies=[Depends(authorize)])
+def uploaded_file(request: Request, relative: str):
+    target = request.app.state.uploads.media_path(relative)
+    if target is None:
+        raise APIError(404, 40410, '上传文件不存在')
+    media_types = {'.m3u8': 'application/vnd.apple.mpegurl', '.ts': 'video/mp2t',
+                   '.vtt': 'text/vtt', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+                   '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp',
+                   '.mp4': 'video/mp4', '.webm': 'video/webm', '.pdf': 'application/pdf'}
+    return FileResponse(target, media_type=media_types.get(target.suffix.lower()),
+                        headers={'Cache-Control': 'private, max-age=3600'})
 
 
 ADMIN_DIST = Path(__file__).parent / 'admin-ui' / 'dist'

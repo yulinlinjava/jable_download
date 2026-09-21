@@ -7,6 +7,8 @@ import unicodedata
 import uuid
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
 
@@ -82,6 +84,36 @@ class CollectionManager:
                           VALUES(?,?,?,?,?,?,?)''',
                        (task_id, name, url, 1, 1 if scheduled_enabled else 0, now, now))
         return self.get(task_id)
+
+    def create_many(self, tasks, scheduled_enabled=False):
+        """Create collection tasks in one transaction and skip duplicate names or URLs."""
+        created, skipped, results = [], [], []
+        now = time.time()
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            existing_rows = db.execute('SELECT name,url FROM collection_tasks').fetchall()
+            names = {self.normalized_title(row['name']) for row in existing_rows}
+            urls = {row['url'] for row in existing_rows}
+            for task in tasks:
+                name, url = task['name'], task['url']
+                name_key = self.normalized_title(name)
+                if name_key in names or url in urls:
+                    skipped.append(dict(page=task.get('page'), name=name, url=url))
+                    results.append(dict(page=task.get('page'), status='skipped',
+                                        name=name, url=url, message='标题或链接已存在'))
+                    continue
+                task_id = uuid.uuid4().hex
+                db.execute('''INSERT INTO collection_tasks(
+                    id,name,url,batch_size,scheduled_enabled,created,updated)
+                    VALUES(?,?,?,?,?,?,?)''',
+                           (task_id, name, url, 1, 1 if scheduled_enabled else 0, now, now))
+                value = dict(id=task_id, page=task.get('page'), name=name, url=url)
+                created.append(value)
+                results.append(dict(**value, status='created', message='创建成功'))
+                names.add(name_key)
+                urls.add(url)
+        return dict(total=len(tasks), created=len(created), skipped=len(skipped),
+                    created_tasks=created, skipped_tasks=skipped, results=results)
 
     def get(self, task_id):
         with self.db() as db:
@@ -185,10 +217,152 @@ class CollectionManager:
                 kind='collection' if row['collection_id'] else 'download', id=row['id'],
                 collection_id=row['collection_id'], source=row['source'], video_id=row['video_id'],
                 title=row['title'], url=row['url'], cover=row['cover_url'],
-                preview_image=row['preview_url'], duration=row['duration'], status=row['status'],
+                preview_image=row['preview_url'], preview_m3u8=row['preview_m3u8_url'],
+                preview5_m3u8=row['preview5_m3u8_url'],
+                duration=row['duration'], status=row['status'],
                 download_task_id=None if pending else row['id'], first_seen=row['first_seen'],
                 last_seen=row['last_seen'], download=None if pending else task))
         return dict(page=page, page_size=page_size, total=total, items=items)
+
+    def export_items(self, item_ids):
+        """Return the stable public resource contract in caller-provided order."""
+        unique_ids = list(dict.fromkeys(filter(None, item_ids)))
+        if not unique_ids:
+            return dict(items=[], missing=[])
+        placeholders = ','.join('?' for _ in unique_ids)
+        with self.db() as db:
+            rows = db.execute(f'SELECT * FROM tasks WHERE id IN ({placeholders})', unique_ids).fetchall()
+        by_id = {row['id']: row for row in rows}
+        items = []
+        for task_id in unique_ids:
+            row = by_id.get(task_id)
+            if not row:
+                continue
+            try:
+                metadata = json.loads(row['metadata_json'] or '{}')
+            except (ValueError, TypeError):
+                metadata = {}
+            poster = (self.downloads.media_url(row['source'], row['video_id'], row['poster_file'])
+                      if row['poster_file'] else metadata.get('poster'))
+            items.append(dict(
+                source=row['source'], id=row['video_id'], title=row['title'] or metadata.get('title'),
+                url=metadata.get('url') or row['url'], cover=row['cover_url'] or metadata.get('cover'),
+                poster=poster, preview_image=row['preview_url'] or metadata.get('preview_image'),
+                vtt_url=row['vtt_url'] or metadata.get('vtt_url'), duration=row['duration'] or metadata.get('duration'),
+                preview_m3u8_url=row['preview_m3u8_url'] or metadata.get('preview_m3u8_url'),
+                preview5_m3u8_url=row['preview5_m3u8_url'] or metadata.get('preview5_m3u8_url'),
+                published_at=row['release_date'] or metadata.get('published_at'),
+                actors=metadata.get('actors') if isinstance(metadata.get('actors'), list) else [],
+                tags=metadata.get('tags') if isinstance(metadata.get('tags'), list) else [],
+                m3u8_url=row['m3u8_url'] or metadata.get('m3u8_url')))
+        return dict(items=items, missing=[task_id for task_id in unique_ids if task_id not in by_id])
+
+    def local_media(self, value):
+        """Resolve public media URLs to files under the configured download root."""
+        if not value:
+            return None
+        try:
+            path = unquote(urlsplit(value).path).replace('\\', '/')
+        except (TypeError, ValueError):
+            return None
+        roots = {
+            '/uploads/': 'uploads', '/jable/': 'jable',
+            '/123/': '123', '/external/': 'external',
+        }
+        for prefix, directory in roots.items():
+            if not path.startswith(prefix):
+                continue
+            relative = path[len(prefix):].lstrip('/')
+            public_root = (self.downloads.root / directory).resolve()
+            target = (public_root / Path(relative)).resolve()
+            if (not relative or public_root not in target.parents or not target.is_file()):
+                raise ValueError(f'本地资源不存在：{path}')
+            return dict(path=target, url=f'{self.downloads.public_base_url}{path}')
+        return None
+
+    def validate_import_items(self, items):
+        """Preview validation and duplicate handling without creating tasks."""
+        from resource_import import validate_resource
+        results, seen_ids, seen_titles = [], set(), set()
+        local_linked = queued = skipped = failed = 0
+        with self.db() as db:
+            for index, item in enumerate(items, 1):
+                try:
+                    metadata = validate_resource(item)
+                    local = self.local_media(
+                        metadata.get('m3u8_url') or metadata.get('video_url') or metadata.get('url'))
+                except ValueError as exc:
+                    failed += 1
+                    results.append(dict(index=index, status='failed', message=str(exc)))
+                    continue
+                title_key = self.normalized_title(metadata['title'])
+                video_key = metadata['id'].strip().casefold()
+                existing = db.execute('''SELECT id FROM tasks
+                    WHERE lower(trim(video_id))=lower(trim(?)) OR title_key=? LIMIT 1''',
+                    (metadata['id'], title_key)).fetchone()
+                if existing or video_key in seen_ids or title_key in seen_titles:
+                    skipped += 1
+                    result = dict(index=index, status='skipped', message='番号或标题已存在，导入时会跳过')
+                    if existing:
+                        result['task_id'] = existing['id']
+                    results.append(result)
+                    continue
+                seen_ids.add(video_key); seen_titles.add(title_key)
+                if local:
+                    local_linked += 1
+                    message = '校验通过，本地资源将直接关联'
+                else:
+                    queued += 1
+                    message = '校验通过，远程资源将加入下载队列'
+                results.append(dict(index=index, status='valid', message=message))
+        return dict(total=len(items), valid=local_linked + queued, local_linked=local_linked,
+                    queued=queued, skipped=skipped, failed=failed, results=results)
+
+    def import_items(self, items):
+        from resource_import import validate_resource
+        results, created_ids, queued_ids = [], [], []
+        local_linked = 0
+        with self.db() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for index, item in enumerate(items, 1):
+                try:
+                    metadata = validate_resource(item)
+                    local = self.local_media(
+                        metadata.get('m3u8_url') or metadata.get('video_url') or metadata.get('url'))
+                except ValueError as exc:
+                    results.append(dict(index=index, status='failed', message=str(exc)))
+                    continue
+                title_key = self.normalized_title(metadata['title'])
+                existing = db.execute('''SELECT id FROM tasks
+                    WHERE lower(trim(video_id))=lower(trim(?)) OR title_key=? LIMIT 1''',
+                    (metadata['id'], title_key)).fetchone()
+                if existing:
+                    results.append(dict(index=index, status='skipped', task_id=existing['id'],
+                                        message='番号或标题已存在，已跳过'))
+                    continue
+                now, task_id = time.time(), uuid.uuid4().hex
+                if local:
+                    metadata['m3u8_url'] = local['url']
+                    metadata['_local_resource'] = True
+                    status, message = 'completed', '本地资源已关联'
+                    local_linked += 1
+                else:
+                    status, message = 'queued', '等待下载'
+                    queued_ids.append(task_id)
+                db.execute('''INSERT INTO tasks(id,source,video_id,title,title_key,url,status,message,
+                    first_seen,last_seen,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    (task_id, metadata['source'], metadata['id'], metadata['title'], title_key,
+                     metadata['url'] or metadata['m3u8_url'], status, message,
+                     now, now, now, now))
+                self.downloads.save_metadata(db, task_id, metadata)
+                created_ids.append(task_id)
+                results.append(dict(index=index, status='created', task_id=task_id, message=message))
+        if queued_ids:
+            self.downloads.wake.set()
+        return dict(total=len(items), created=len(created_ids),
+                    skipped=sum(item['status'] == 'skipped' for item in results),
+                    failed=sum(item['status'] == 'failed' for item in results),
+                    local_linked=local_linked, queued=len(queued_ids), results=results)
 
     def schedule_item(self, item_id, retry_failed=True):
         with self.db() as db:
@@ -278,14 +452,16 @@ class CollectionManager:
                             same_code = existing['video_id'].strip().casefold() == item['id'].strip().casefold()
                             if same_code:
                                 db.execute('''UPDATE tasks SET collection_id=?,source=?,title=?,title_key=?,url=?,
-                                    cover_url=coalesce(?,cover_url),preview_url=coalesce(?,preview_url),
+                                    cover_url=CASE WHEN cover_url LIKE '/api/download/%' THEN cover_url ELSE coalesce(?,cover_url) END,
+                                    preview_url=CASE WHEN preview_url LIKE '/api/download/%' THEN preview_url ELSE coalesce(?,preview_url) END,
                                     duration=coalesce(?,duration),last_seen=?,updated=? WHERE id=?''',
                                     (row['id'], item['source'], item.get('title'), title_key, item['url'],
                                      item.get('cover'), item.get('preview_image'), item.get('duration'),
                                      now, now, existing['id']))
                             else:
                                 db.execute('''UPDATE tasks SET collection_id=?,last_seen=?,updated=?,
-                                    cover_url=coalesce(cover_url,?),preview_url=coalesce(preview_url,?),
+                                    cover_url=CASE WHEN cover_url LIKE '/api/download/%' THEN cover_url ELSE coalesce(cover_url,?) END,
+                                    preview_url=CASE WHEN preview_url LIKE '/api/download/%' THEN preview_url ELSE coalesce(preview_url,?) END,
                                     duration=coalesce(duration,?) WHERE id=?''',
                                     (row['id'], now, now, item.get('cover'), item.get('preview_image'),
                                      item.get('duration'), existing['id']))

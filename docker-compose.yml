@@ -2,17 +2,14 @@ services:
   api:
     build: .
     image: jable-downloader:latest
-    command: ["python", "-m", "uvicorn", "api:app", "--app-dir", "/app", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "8000:8000"
     environment:
-      JABLE_API_KEY: ${JABLE_API_KEY:-}
-      JABLE_TIMEOUT: ${JABLE_TIMEOUT:-30}
-      DOWNLOAD_DIR: /downloads
-      DATABASE_PATH: /data/tasks.sqlite3
+      JABLE_API_KEY: ${JABLE_API_KEY:-yes@1234}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
+      DOWNLOAD_DIR: ${DOWNLOAD_DIR:-/downloads}
     volumes:
       - ./downloads:/downloads
-      - api_data_v2:/data
     stop_grace_period: 50s
     restart: unless-stopped
 
@@ -21,24 +18,10 @@ services:
     build: .
     image: jable-downloader:latest
     container_name: jable_downloader
+    command: ["python", "/app/main.py"]
     environment:
       - URL=${URL:-}          # 透過環境變數傳入影片網址
     volumes:
       - ./downloads:/downloads  # 本機 downloads 資料夾 ←→ 容器內 /downloads
     stdin_open: true            # 保持 stdin 開啟（互動模式）
     tty: true
-
-  # ---- (可選) Redis 任務佇列 ----
-  # 未來擴充成多任務排隊下載時使用
-  redis:
-    image: redis:7-alpine
-    container_name: jable_redis
-    ports:
-      - "6379:6379"
-    volumes:
-      - redis_data:/data
-    restart: unless-stopped
-
-volumes:
-  api_data_v2:
-  redis_data:

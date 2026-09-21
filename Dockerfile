@@ -17,10 +17,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
-# ---- 環境變數 ----
-# 告知 Selenium 使用系統的 Chromium
-ENV CHROME_BIN=/usr/bin/chromium
-ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+# ---- 容器預設設定 ----
+# docker run 只需提供端口和持久化目錄；仍可用 -e 覆蓋任意值。
+ENV CHROME_BIN=/usr/bin/chromium \
+    CHROMEDRIVER_PATH=/usr/bin/chromedriver \
+    PYTHONUNBUFFERED=1 \
+    JABLE_TIMEOUT=30 \
+    PUBLIC_BASE_URL=http://localhost:8000 \
+    DOWNLOAD_DIR=/downloads
 
 # ---- 工作目錄 ----
 WORKDIR /app
@@ -35,13 +39,12 @@ COPY . .
 COPY --from=admin-build /admin/dist /app/admin-ui/dist
 
 # ---- 掛載點 ----
-# 下載的影片會存放到 /downloads，可透過 -v 掛載到本機
+# 下载文件、上传文件和 tasks.sqlite3 使用同一个持久化目录
 VOLUME ["/downloads"]
+EXPOSE 8000
 
 # 預設工作目錄切到下載資料夾
 WORKDIR /downloads
 
-# ---- 啟動指令 ----
-# 執行主程式，透過環境變數 URL 傳入影片網址
-# 用法: docker run -e URL="https://jable.tv/..." jable-downloader
-CMD ["python", "/app/main.py"]
+# 預設啟動 API 和管理後台；命令行下載模式可顯式執行 python /app/main.py
+CMD ["python", "-m", "uvicorn", "api:app", "--app-dir", "/app", "--host", "0.0.0.0", "--port", "8000"]

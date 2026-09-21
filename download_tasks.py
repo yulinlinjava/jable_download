@@ -15,13 +15,14 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import m3u8
 import requests
 from Crypto.Cipher import AES
 from bs4 import BeautifulSoup
 from config import headers
+from media_previews import MediaPreviewGenerator
 
 log = logging.getLogger(__name__)
 
@@ -93,14 +94,15 @@ class FileDownloader:
         self.cancel_check = cancel_check
 
     def fetch(self, task_id, transport, url, byte_range=None,
-              limit=64 * 1024 * 1024, attempts=3, validator=None):
+              limit=64 * 1024 * 1024, attempts=3, validator=None, resource_type=None):
         last_error = None
         for attempt in range(attempts):
             if self.stop_event.is_set():
                 raise Stopped()
             self.cancel_check(task_id)
             try:
-                data = transport.get(url, byte_range=byte_range, limit=limit)
+                data = transport.get(url, byte_range=byte_range, limit=limit,
+                                     resource_type=resource_type)
                 # Invalid responses still crossed the network and belong in the meter.
                 self.speed_meter.record(len(data))
                 self.cancel_check(task_id)
@@ -123,9 +125,10 @@ class FileDownloader:
         return {'path': str(path), 'size': len(data), 'hash': digest(data)}
 
     def download(self, task_id, transport, url, path, byte_range=None,
-                 limit=64 * 1024 * 1024, attempts=3, validator=None):
+                 limit=64 * 1024 * 1024, attempts=3, validator=None, resource_type=None):
         data = self.fetch(task_id, transport, url, byte_range=byte_range,
-                          limit=limit, attempts=attempts, validator=validator)
+                          limit=limit, attempts=attempts, validator=validator,
+                          resource_type=resource_type)
         return self.save(path, data)
 
 
@@ -215,6 +218,49 @@ def public_url(url):
     return url
 
 
+class HttpTransport:
+    """Direct HLS resources, with the same public-network boundary as browser downloads."""
+    def __init__(self, session, referer=None):
+        self.session = session
+        self.resolved_urls = {}
+        self.headers = dict(headers)
+        if referer:
+            self.headers['Referer'] = referer
+
+    def get(self, url, byte_range=None, limit=64 * 1024 * 1024,
+            resource_type=None, extra_headers=None):
+        original_url = url
+        request_headers = dict(self.headers)
+        request_headers.update(extra_headers or {})
+        if byte_range:
+            request_headers['Range'] = f'bytes={byte_range[0]}-{byte_range[0] + byte_range[1] - 1}'
+        for _ in range(6):
+            public_url(url)
+            with self.session.get(url, headers=request_headers, timeout=(10, 30),
+                                  stream=True, allow_redirects=False) as response:
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get('Location')
+                    if not location:
+                        raise DownloadError('资源重定向地址缺失')
+                    url = urljoin(url, location)
+                    continue
+                if not 200 <= response.status_code < 300:
+                    raise DownloadError(f'资源获取失败：HTTP {response.status_code}')
+                if byte_range and response.status_code != 206:
+                    raise DownloadError('资源不支持分片字节范围')
+                chunks, size = [], 0
+                for chunk in response.iter_content(65536):
+                    size += len(chunk)
+                    if size > limit:
+                        raise DownloadError('资源文件超过大小限制')
+                    chunks.append(chunk)
+                if byte_range and size != byte_range[1]:
+                    raise DownloadError('分片字节范围长度不匹配')
+                self.resolved_urls[original_url] = url
+                return b''.join(chunks)
+        raise DownloadError('资源重定向次数过多')
+
+
 class BrowserTransport:
     """Fetch with the same browser origin/session that resolved the stream."""
     def __init__(self, driver, cdp_fallback=False):
@@ -258,15 +304,17 @@ class BrowserTransport:
             self.driver.execute_cdp_cmd('IO.close',{'handle':handle})
         return b''.join(chunks)
 
-    def get(self, url, byte_range=None, limit=64 * 1024 * 1024):
+    def get(self, url, byte_range=None, limit=64 * 1024 * 1024,
+            resource_type=None, extra_headers=None):
         public_url(url)
         result = self.driver.execute_async_script("""
-          const [url, range, limit, done] = arguments;
+          const [url, range, limit, extraHeaders, done] = arguments;
           const controller = new AbortController();
           const timer = setTimeout(()=>controller.abort(), 30000);
           (async()=>{
-            const r = await fetch(url, {redirect:'error', signal:controller.signal,
-              headers:range ? {Range:'bytes='+range[0]+'-'+(range[0]+range[1]-1)} : {}});
+            const requestHeaders = Object.assign({}, extraHeaders || {});
+            if(range) requestHeaders.Range='bytes='+range[0]+'-'+(range[0]+range[1]-1);
+            const r = await fetch(url, {redirect:'error', signal:controller.signal, headers:requestHeaders});
             if (!r.ok) throw new Error('HTTP '+r.status);
             if (range && r.status !== 206) throw new Error('Range unsupported');
             const reader=r.body.getReader(); let size=0, chunks=[];
@@ -277,14 +325,37 @@ class BrowserTransport:
               binary+=String.fromCharCode(...chunk.subarray(i,i+32768));
             done({data:btoa(binary)});
           })().catch(e=>done({error:String(e).slice(0,120)})).finally(()=>clearTimeout(timer));
-        """, url, byte_range, limit)
+        """, url, byte_range, limit, extra_headers or {})
         if not result or 'error' in result:
-            if byte_range is None:
+            if byte_range is None and not extra_headers:
                 return self.cdp_get(url,limit)
             raise DownloadError('资源获取失败：' + ((result or {}).get('error', '浏览器无响应')))
         data = base64.b64decode(result['data'])
         if byte_range and len(data) != byte_range[1]:
             raise DownloadError('分片字节范围长度不匹配')
+        return data
+
+
+class SigningTransport:
+    """Apply the current source signer immediately before each network request."""
+    def __init__(self, transport, signers, task):
+        self.transport, self.signers, self.task = transport, signers, task
+        self.resolved_urls = {}
+
+    def get(self, url, byte_range=None, limit=64 * 1024 * 1024, resource_type=None):
+        from download_signers import SignerError
+        context = dict(task_id=self.task['id'], video_id=self.task['video_id'],
+                       resource_type=resource_type or 'resource', referer=self.task.get('url'))
+        try:
+            signed = self.signers.sign(self.task['source'], url, context)
+        except SignerError as exc:
+            raise DownloadError(str(exc)) from None
+        data = self.transport.get(signed['url'], byte_range=byte_range, limit=limit,
+                                  resource_type=resource_type, extra_headers=signed['headers'])
+        # Keep redirects and a signer-selected host/path for relative HLS resolution.
+        # DownloadManager persists only the plan fingerprint, so this URL stays in memory.
+        self.resolved_urls[url] = getattr(self.transport, 'resolved_urls', {}).get(
+            signed['url'], signed['url'])
         return data
 
 
@@ -345,11 +416,13 @@ def build_plan(file_downloader, task_id, transport, stream_url):
             if not data.decode('utf-8-sig').lstrip().startswith('#EXTM3U'):
                 raise DownloadError('来源没有返回有效 m3u8')
         raw = file_downloader.fetch(task_id, transport, url, limit=4 * 1024 * 1024,
-                                    validator=validate).decode('utf-8-sig')
+                                    validator=validate, resource_type='playlist').decode('utf-8-sig')
         return m3u8.loads(raw)
 
     master_url = stream_url
     top = playlist(stream_url)
+    stream_url = getattr(transport, 'resolved_urls', {}).get(stream_url, stream_url)
+    master_url = stream_url
     tracks = [('video', stream_url, top)]
     master = None
     if top.is_variant:
@@ -357,15 +430,20 @@ def build_plan(file_downloader, task_id, transport, stream_url):
             raise DownloadError('主清单没有视频流')
         chosen = max(top.playlists, key=lambda p: ((p.stream_info.resolution or (0,0))[0] * (p.stream_info.resolution or (0,0))[1], p.stream_info.bandwidth or 0))
         stream_url = urljoin(stream_url, chosen.uri)
-        tracks = [('video', stream_url, playlist(stream_url))]
+        video_playlist = playlist(stream_url)
+        stream_url = getattr(transport, 'resolved_urls', {}).get(stream_url, stream_url)
+        tracks = [('video', stream_url, video_playlist)]
         audio = [a for a in top.media if a.type == 'AUDIO' and a.group_id == chosen.stream_info.audio and a.uri]
         if audio:
             selected = next((a for a in audio if a.default == 'YES'), audio[0])
             audio_url = urljoin(master_url, selected.uri)
-            tracks.append(('audio', audio_url, playlist(audio_url)))
+            audio_playlist = playlist(audio_url)
+            audio_url = getattr(transport, 'resolved_urls', {}).get(audio_url, audio_url)
+            tracks.append(('audio', audio_url, audio_playlist))
         master = chosen.stream_info
 
     resources, manifests = [], {}
+    multiple_tracks = len(tracks) > 1
     for track, location, data in tracks:
         if data.is_variant or not data.is_endlist or not data.segments:
             raise DownloadError('仅支持已结束的点播清单，不支持直播或嵌套主清单')
@@ -391,7 +469,8 @@ def build_plan(file_downloader, task_id, transport, stream_url):
                     raise DownloadError('暂不支持带字节范围的初始化片段')
                 original = urljoin(location, init.uri)
                 if original not in map_paths:
-                    path = f'segments/{track}-init-{len(map_paths):04d}.ts'
+                    prefix = f'{track}-' if multiple_tracks else ''
+                    path = f'{prefix}init-{len(map_paths):04d}.ts'
                     map_paths[original] = path
                     resources.append(dict(path=path, kind='init', url=original, byte_range=None))
             original = urljoin(location, segment.uri)
@@ -406,14 +485,17 @@ def build_plan(file_downloader, task_id, transport, stream_url):
                 byte_range = [offset, count]
                 offset += count
             previous_uri = original
-            resources.append(dict(path=f'segments/{track}-{i+1:06d}.ts', kind='segment', url=original,
+            prefix = f'{track}-' if multiple_tracks else ''
+            segment_path = f'{prefix}{i:04d}.ts'
+            resources.append(dict(path=segment_path, kind='segment', url=original,
                                   byte_range=byte_range, duration=segment.duration,
                                   sequence=int(data.media_sequence or 0)+i, key=key_id,
                                   iv=segment.key.iv if key_id else None,
                                   discontinuity=bool(segment.discontinuity)))
         # Mutate only after collecting original URLs (key/map objects are shared).
         for i, segment in enumerate(data.segments):
-            segment.uri = f'segments/{track}-{i+1:06d}.ts'
+            prefix = f'{track}-' if multiple_tracks else ''
+            segment.uri = f'{prefix}{i:04d}.ts'
             segment.byterange = None
         for key in data.keys:
             if key and key.method != 'NONE':
@@ -459,9 +541,11 @@ class DownloadManager:
     def __init__(self, root, resolver=browser_source, start_enabled=True, database=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self.public_base_url = os.getenv('PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')
         self.database = Path(database).resolve() if database else self.root / 'tasks.sqlite3'
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.resolver = resolver
+        self.signers = None
         self.stop_event, self.wake = threading.Event(), threading.Event()
         self.cancelled = set()
         self.dispatch_lock = threading.Lock()
@@ -492,7 +576,9 @@ class DownloadManager:
                   video_id TEXT NOT NULL, title TEXT, title_key TEXT, url TEXT NOT NULL,
                   release_date TEXT, duration TEXT, cover_url TEXT, poster_file TEXT,
                   preview_url TEXT, preview_file TEXT, vtt_url TEXT, vtt_file TEXT,
-                  m3u8_url TEXT, metadata_json TEXT NOT NULL DEFAULT '{}',
+                  m3u8_url TEXT, preview_m3u8_url TEXT, preview_m3u8_file TEXT,
+                  preview5_m3u8_url TEXT, preview5_m3u8_file TEXT,
+                  metadata_json TEXT NOT NULL DEFAULT '{}',
                   status TEXT NOT NULL DEFAULT 'pending', message TEXT, error TEXT,
                   warnings TEXT NOT NULL DEFAULT '[]', plan TEXT,
                   assets_refresh INTEGER NOT NULL DEFAULT 0,
@@ -511,11 +597,24 @@ class DownloadManager:
                 CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status,created);
                 CREATE INDEX IF NOT EXISTS tasks_collection ON tasks(collection_id,last_seen);
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(tasks)').fetchall()}
+            for name in ('preview_m3u8_url', 'preview_m3u8_file',
+                         'preview5_m3u8_url', 'preview5_m3u8_file'):
+                if name not in columns:
+                    db.execute(f'ALTER TABLE tasks ADD COLUMN {name} TEXT')
             db.execute("UPDATE tasks SET status='queued',updated=? WHERE status='downloading'", (time.time(),))
             db.execute('UPDATE tasks SET assets_refresh=1 WHERE assets_refresh=2')
             self.rebuild_progress(db)
         self.speed_meter = SpeedMeter(window_seconds=5.0)
         self.file_downloader = FileDownloader(self.speed_meter, self.stop_event, self.check_cancelled)
+        try:
+            preview_timeout = int(os.getenv('DOWNLOAD_PREVIEW_TIMEOUT',
+                                             os.getenv('UPLOAD_VIDEO_TIMEOUT', '3600')))
+            preview_interval = int(os.getenv('DOWNLOAD_PREVIEW_INTERVAL',
+                                              os.getenv('UPLOAD_PREVIEW_INTERVAL', '10')))
+        except ValueError:
+            preview_timeout, preview_interval = 3600, 10
+        self.preview_generator = MediaPreviewGenerator(preview_timeout, preview_interval)
         self.threads = [threading.Thread(target=self.run, args=(index,), name=f'download-worker-{index + 1}', daemon=True)
                         for index in range(self.MAX_CONCURRENCY)]
         for thread in self.threads:
@@ -594,6 +693,18 @@ class DownloadManager:
         if self.is_cancelled(task_id):
             raise Cancelled()
 
+    @staticmethod
+    def source_directory(source):
+        """Keep provider grouping while using the public disk directory name."""
+        source = str(source).strip().lower()
+        return '123' if source == '123av' else 'jable' if source == 'jable' else 'external/' + source
+
+    def task_folder(self, source, video_id):
+        folder = (self.root / self.source_directory(source) / str(video_id)).resolve()
+        if folder == self.root or self.root not in folder.parents:
+            raise DownloadError('任务资源目录不安全')
+        return folder
+
     def delete(self, task_id):
         with self.dispatch_lock:
             with self.db() as db:
@@ -612,9 +723,7 @@ class DownloadManager:
                 if remaining <= 0:
                     raise DownloadError('任务正在停止，请稍后重试删除')
                 self.active_condition.wait(min(1,remaining))
-        folder = (self.root / row['source'] / row['video_id']).resolve()
-        if folder == self.root or self.root not in folder.parents:
-            raise DownloadError('任务资源目录不安全，拒绝删除')
+        folder = self.task_folder(row['source'], row['video_id'])
         if folder.exists():
             shutil.rmtree(folder)
         with self.db() as db:
@@ -623,6 +732,28 @@ class DownloadManager:
         with self.active_condition:
             self.cancelled.discard(task_id)
         return dict(task_id=task_id,deleted=True,deleted_path=str(folder))
+
+    def delete_many(self, task_ids):
+        deleted, missing, failed = [], [], []
+        for task_id in dict.fromkeys(task_ids):
+            try:
+                result = self.delete(task_id)
+                if result:
+                    deleted.append(task_id)
+                else:
+                    missing.append(task_id)
+            except Exception as exc:
+                failed.append({'id': task_id, 'message': str(exc) if isinstance(exc, DownloadError)
+                               else '删除失败'})
+        return {
+            'total': len(list(dict.fromkeys(task_ids))),
+            'deleted': len(deleted),
+            'missing': len(missing),
+            'failed': len(failed),
+            'deleted_ids': deleted,
+            'missing_ids': missing,
+            'failures': failed,
+        }
 
     def submit(self, source, video_id, url):
         with self.db() as db:
@@ -671,28 +802,57 @@ class DownloadManager:
         self.wake.set()
         return results
 
-    @staticmethod
-    def save_metadata(db, task_id, metadata):
+    def media_url(self, source, video_id, path):
+        if not path:
+            return None
+        source_path = quote(self.source_directory(source), safe='/')
+        video_path = quote(str(video_id), safe='')
+        file_path = quote(str(path).replace('\\', '/'), safe='/')
+        return f'{self.public_base_url}/{source_path}/{video_path}/{file_path}'
+
+    def save_metadata(self, db, task_id, metadata):
+        task = db.execute('SELECT source,video_id FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if not task:
+            raise DownloadError('下载任务不存在')
+        poster_file = metadata.get('poster_local') or metadata.get('cover_local')
+        cover_file = metadata.get('cover_local') or poster_file
+        preview_file = metadata.get('preview_image_local')
+        vtt_file = metadata.get('vtt_local')
+        m3u8_file = metadata.get('m3u8_local')
+        preview_m3u8_file = metadata.get('preview_m3u8_local')
+        preview5_m3u8_file = metadata.get('preview5_m3u8_local')
         db.execute('''UPDATE tasks SET title=coalesce(?,title),release_date=coalesce(?,release_date),
                       duration=coalesce(?,duration),cover_url=coalesce(?,cover_url),
                       poster_file=coalesce(?,poster_file),preview_url=coalesce(?,preview_url),
                       preview_file=coalesce(?,preview_file),vtt_url=coalesce(?,vtt_url),
-                      vtt_file=coalesce(?,vtt_file),m3u8_url=coalesce(?,m3u8_url),metadata_json=? WHERE id=?''',
+                      vtt_file=coalesce(?,vtt_file),m3u8_url=coalesce(?,m3u8_url),
+                      preview_m3u8_url=coalesce(?,preview_m3u8_url),
+                      preview_m3u8_file=coalesce(?,preview_m3u8_file),
+                      preview5_m3u8_url=coalesce(?,preview5_m3u8_url),
+                      preview5_m3u8_file=coalesce(?,preview5_m3u8_file),metadata_json=? WHERE id=?''',
                    (metadata.get('title'), metadata.get('release_date') or metadata.get('published_at'),
-                    metadata.get('duration'), metadata.get('cover'),
-                    metadata.get('poster_local') or metadata.get('cover_local'), metadata.get('preview_image'),
-                    metadata.get('preview_image_local'), metadata.get('vtt_url'), metadata.get('vtt_local'),
-                    metadata.get('m3u8_url'), json.dumps(metadata,ensure_ascii=False), task_id))
+                    metadata.get('duration'), self.media_url(task['source'], task['video_id'], cover_file) or metadata.get('cover'),
+                    poster_file, self.media_url(task['source'], task['video_id'], preview_file) or metadata.get('preview_image'),
+                    preview_file, self.media_url(task['source'], task['video_id'], vtt_file) or metadata.get('vtt_url'), vtt_file,
+                    self.media_url(task['source'], task['video_id'], m3u8_file) or metadata.get('m3u8_url'),
+                    self.media_url(task['source'], task['video_id'], preview_m3u8_file) or metadata.get('preview_m3u8_url'),
+                    preview_m3u8_file,
+                    self.media_url(task['source'], task['video_id'], preview5_m3u8_file) or metadata.get('preview5_m3u8_url'),
+                    preview5_m3u8_file,
+                    json.dumps(metadata,ensure_ascii=False), task_id))
 
     def serialize_task(self, row):
         total, done = row['total_segments'] or 0, row['downloaded_segments'] or 0
-        folder = self.root / row['source'] / row['video_id']
+        folder = self.task_folder(row['source'], row['video_id'])
         return dict(task_id=row['id'],source=row['source'],video_id=row['video_id'],url=row['url'],status=row['status'],
                     downloaded_segments=done,total_segments=total,downloaded_bytes=row['downloaded_bytes'] or 0,
                     progress=100.0 if row['status']=='completed' else min(99.9,round(done/total*100,2)) if total else 0.0,
                     save_path=str(folder),playlist_path=str(folder/'index.m3u8') if row['status']=='completed' else None,
                     title=row['title'],poster_file=row['poster_file'],cover_url=row['cover_url'],
-                    preview_file=row['preview_file'],preview_url=row['preview_url'],vtt_file=row['vtt_file'],
+                    preview_file=row['preview_file'],preview_url=row['preview_url'],
+                    vtt_file=row['vtt_file'],vtt_url=row['vtt_url'],m3u8_url=row['m3u8_url'],
+                    preview_m3u8_file=row['preview_m3u8_file'],preview_m3u8_url=row['preview_m3u8_url'],
+                    preview5_m3u8_file=row['preview5_m3u8_file'],preview5_m3u8_url=row['preview5_m3u8_url'],
                     message=row['message'],error=row['error'],warnings=json.loads(row['warnings']),
                     created_at=row['created'],updated_at=row['updated'])
 
@@ -761,7 +921,7 @@ class DownloadManager:
         task = self.get(task_id)
         if not task:
             return None
-        folder = (self.root / task['source'] / task['video_id']).resolve()
+        folder = self.task_folder(task['source'], task['video_id'])
         target = (folder / relative).resolve()
         if target == folder or folder not in target.parents or not target.is_file():
             return None
@@ -825,14 +985,26 @@ class DownloadManager:
                     self.active_condition.notify_all()
                 self.wake.set()
 
+    @contextmanager
+    def task_source(self, task):
+        metadata = json.loads(task.get('metadata_json') or '{}')
+        if metadata.get('_imported'):
+            with requests.Session() as session:
+                transport = HttpTransport(session, metadata.get('url'))
+                yield metadata, SigningTransport(transport, self.signers, task) if self.signers else transport
+        else:
+            with self.resolver(task['url']) as (metadata, transport):
+                yield metadata, SigningTransport(transport, self.signers, task) if self.signers else transport
+
     def refresh_assets(self, task):
-        folder = self.root / task['source'] / task['video_id']
+        folder = self.task_folder(task['source'], task['video_id'])
         try:
             self.check_cancelled(task['id'])
-            with self.resolver(task['url']) as (metadata, transport):
+            with self.task_source(task) as (metadata, transport):
                 self.check_cancelled(task['id'])
                 metadata = self.merge_existing_metadata(task, metadata)
                 warnings = self.assets(task, folder, metadata, transport)
+                warnings = self.generate_import_previews(task, folder, metadata, warnings)
             with self.db() as db:
                 self.save_metadata(db, task['id'], metadata)
                 db.execute("UPDATE tasks SET assets_refresh=0,message='下载完成',warnings=?,updated=? WHERE id=?",
@@ -853,24 +1025,139 @@ class DownloadManager:
             previous = json.loads(task.get('metadata_json') or '{}')
         except (ValueError, TypeError):
             return metadata
-        for field in ('cover','poster','preview_image','vtt_url'):
+        local_fields = {'cover': 'cover_local', 'poster': 'poster_local',
+                        'preview_image': 'preview_image_local', 'vtt_url': 'vtt_local',
+                        'preview_m3u8_url': 'preview_m3u8_local',
+                        'preview5_m3u8_url': 'preview5_m3u8_local'}
+        for field, local in local_fields.items():
             if not metadata.get(field) and previous.get(field):
                 metadata[field] = previous[field]
-            local = field + '_local' if field != 'vtt_url' else 'vtt_local'
             if previous.get(local):
                 metadata.setdefault(local,previous[local])
+        if previous.get('m3u8_local'):
+            metadata.setdefault('m3u8_local', previous['m3u8_local'])
         return metadata
 
+    def task_message(self, task_id, message):
+        self.check_cancelled(task_id)
+        with self.db() as db:
+            db.execute('UPDATE tasks SET message=?,updated=? WHERE id=?',
+                       (message, time.time(), task_id))
+
+    @staticmethod
+    def remove_asset_warnings(warnings, *fields):
+        prefixes = tuple(field + ' ' for field in fields)
+        warnings[:] = [warning for warning in warnings if not warning.startswith(prefixes)]
+
+    def record_generated_assets(self, task_id, folder):
+        paths = set()
+        for pattern in ('cover.jpg', 'poster.jpg', 'preview_image.mp4', 'preview.vtt',
+                        'preview.jpg', 'preview-*.jpg', 'preview.m3u8', 'preview-track-*.m3u8',
+                        'preview5.m3u8', 'preview5-track-*.m3u8'):
+            paths.update(path for path in folder.glob(pattern) if path.is_file())
+        with self.db() as db:
+            for path in paths:
+                checksum = hashlib.sha256()
+                with path.open('rb') as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                        checksum.update(chunk)
+                db.execute('INSERT OR REPLACE INTO files(task_id,path,kind,size,hash) VALUES(?,?,?,?,?)',
+                           (task_id, path.relative_to(folder).as_posix(), 'asset',
+                            path.stat().st_size, checksum.hexdigest()))
+
+    def generate_import_previews(self, task, folder, metadata, warnings):
+        """Fill optional imported assets from the completed local HLS copy."""
+        if not metadata.get('_imported'):
+            return warnings
+        source = folder / 'index.m3u8'
+        if not source.is_file():
+            return warnings
+        need_cover = not metadata.get('cover_local')
+        need_poster = not metadata.get('poster_local')
+        need_hover = not metadata.get('preview_image_local')
+        need_vtt = not metadata.get('vtt_local')
+        duration = None
+        if need_cover or need_poster or need_hover or need_vtt:
+            duration = self.preview_generator.duration(source)
+
+        if need_cover or need_poster:
+            self.task_message(task['id'], '正在生成本地封面')
+            try:
+                self.preview_generator.cover(source, folder, duration, need_cover, need_poster)
+            except Exception:
+                log.warning('Cover generation %s failed', task['id'], exc_info=True)
+            if need_cover and (folder / 'cover.jpg').is_file():
+                metadata['cover_local'] = 'cover.jpg'
+                self.remove_asset_warnings(warnings, 'cover')
+            elif need_cover:
+                warnings.append('cover 本地生成失败')
+            if need_poster and (folder / 'poster.jpg').is_file():
+                metadata['poster_local'] = 'poster.jpg'
+                self.remove_asset_warnings(warnings, 'poster')
+            elif need_poster:
+                warnings.append('poster 本地生成失败')
+
+        if need_hover:
+            self.task_message(task['id'], '正在生成本地悬浮预览')
+            try:
+                generated = self.preview_generator.hover(source, folder, duration)
+            except Exception:
+                generated = False
+                log.warning('Hover preview generation %s failed', task['id'], exc_info=True)
+            if generated:
+                metadata['preview_image_local'] = 'preview_image.mp4'
+                self.remove_asset_warnings(warnings, 'preview_image')
+            else:
+                warnings.append('preview_image 本地生成失败')
+
+        if need_vtt:
+            self.task_message(task['id'], '正在生成本地进度预览')
+            try:
+                generated = self.preview_generator.vtt(source, folder, duration)
+            except Exception:
+                generated = False
+                log.warning('VTT generation %s failed', task['id'], exc_info=True)
+            if generated:
+                metadata['vtt_local'] = 'preview.vtt'
+                warnings[:] = [warning for warning in warnings
+                               if warning not in ('VTT 来源未提供', 'VTT 或进度缩略图下载失败')]
+            else:
+                warnings.append('VTT 本地生成失败')
+
+        previews = ((180, 'preview.m3u8', 'preview_m3u8_local', '3'),
+                    (300, 'preview5.m3u8', 'preview5_m3u8_local', '5'))
+        for seconds, name, metadata_field, minutes in previews:
+            self.task_message(task['id'], f'正在生成{minutes}分钟预览清单')
+            try:
+                generated = self.preview_generator.preview_playlist(folder, seconds, name)
+            except Exception:
+                generated = False
+                log.warning('%s generation %s failed', name, task['id'], exc_info=True)
+            if generated:
+                metadata[metadata_field] = name
+                self.remove_asset_warnings(warnings, name)
+            else:
+                warnings.append(name + ' 本地生成失败')
+        try:
+            self.record_generated_assets(task['id'], folder)
+        except Exception:
+            warnings.append('本地预览文件登记失败')
+            log.warning('Preview asset registration %s failed', task['id'], exc_info=True)
+        return list(dict.fromkeys(warnings))
+
     def download(self, task):
-        folder = self.root / task['source'] / task['video_id']
+        folder = self.task_folder(task['source'], task['video_id'])
         folder.mkdir(parents=True,exist_ok=True)
-        with self.resolver(task['url']) as (metadata, transport):
+        with self.task_source(task) as (metadata, transport):
             plan = build_plan(self.file_downloader, task['id'], transport, metadata['m3u8_url'])
             with self.db() as db:
                 previous = db.execute('SELECT plan FROM tasks WHERE id=?',(task['id'],)).fetchone()['plan']
                 if previous and json.loads(previous)['fingerprint'] != plan['fingerprint']:
                     raise DownloadError('来源分片结构已变化，保留原文件，禁止混合不同版本')
-                db.execute('UPDATE tasks SET plan=?,updated=? WHERE id=?',(json.dumps(plan),time.time(),task['id']))
+                # Only persist the stable structure fingerprint. Resource URLs may contain
+                # short-lived signatures and always belong in memory.
+                stored_plan = json.dumps({'fingerprint': plan['fingerprint']})
+                db.execute('UPDATE tasks SET plan=?,updated=? WHERE id=?',(stored_plan,time.time(),task['id']))
                 for resource in plan['resources']:
                     db.execute('INSERT OR IGNORE INTO files(task_id,path,kind) VALUES(?,?,?)',(task['id'],resource['path'],resource['kind']))
                 self.save_metadata(db, task['id'], metadata)
@@ -886,7 +1173,7 @@ class DownloadManager:
                 if saved['hash'] and path.is_file() and path.stat().st_size == saved['size'] and digest(path.read_bytes()) == saved['hash']:
                     if resource['kind'] == 'key':
                         current_key = self.file_downloader.fetch(
-                            task['id'], transport, resource['url'], limit=1024)
+                            task['id'], transport, resource['url'], limit=1024, resource_type='key')
                         if digest(current_key) != saved['hash']:
                             raise DownloadError('来源密钥已变化，禁止混合不同版本')
                     continue
@@ -897,7 +1184,8 @@ class DownloadManager:
                 result = self.file_downloader.download(
                     task['id'], transport, resource['url'], path,
                     byte_range=resource['byte_range'],
-                    validator=lambda data, current=resource: validate_payload(data,current,folder))
+                    validator=lambda data, current=resource: validate_payload(data,current,folder),
+                    resource_type=resource['kind'])
                 with self.db() as db:
                     db.execute('UPDATE files SET size=?,hash=? WHERE task_id=? AND path=?',
                                (result['size'],result['hash'],task['id'],resource['path']))
@@ -916,9 +1204,11 @@ class DownloadManager:
                 self.rebuild_progress(db, task['id'])
                 db.execute("UPDATE tasks SET message='正在下载封面和预览',updated=? WHERE id=?",
                            (time.time(),task['id']))
-            warnings = self.assets(task,folder,metadata,transport)
             for name, content in plan['manifests'].items():
                 self.file_downloader.save(folder/name,content.encode())
+            metadata['m3u8_local'] = 'index.m3u8'
+            warnings = self.assets(task,folder,metadata,transport)
+            warnings = self.generate_import_previews(task, folder, metadata, warnings)
             with self.db() as db:
                 self.save_metadata(db, task['id'], metadata)
                 self.rebuild_progress(db, task['id'])
@@ -927,7 +1217,7 @@ class DownloadManager:
 
     def assets(self, task, folder, metadata, transport):
         warnings = []
-        def save(url, name, image=False, visual=False):
+        def save(url, name, image=False, visual=False, resource_type='asset'):
             stem = str(Path(name).with_suffix('')) if image or visual else name
             with self.db() as db:
                 if image or visual:
@@ -949,7 +1239,8 @@ class DownloadManager:
                 if visual and extension not in ('.jpg','.png','.gif','.webp','.mp4','.webm'):
                     raise DownloadError('预览资源不是支持的图片或视频格式')
             data = self.file_downloader.fetch(task['id'], transport, url,
-                                              limit=20*1024*1024, validator=validate)
+                                              limit=20*1024*1024, validator=validate,
+                                              resource_type=resource_type)
             extension = asset_extension(data)
             if image or visual:
                 name = stem + extension
@@ -966,7 +1257,8 @@ class DownloadManager:
                 warnings.append(field+' 来源未提供')
                 continue
             try:
-                _, local_name = save(url,field+'.asset',image=field != 'preview_image',visual=field == 'preview_image')
+                _, local_name = save(url,field+'.asset',image=field != 'preview_image',
+                                     visual=field == 'preview_image', resource_type=field)
                 metadata[field+'_local'] = local_name
             except (Stopped, Cancelled):
                 raise
@@ -976,7 +1268,7 @@ class DownloadManager:
             try:
                 self.check_cancelled(task['id'])
                 base = metadata['vtt_url']
-                raw = save(base,'preview-source.vtt')[0].decode('utf-8-sig')
+                raw = save(base,'preview-source.vtt',resource_type='vtt')[0].decode('utf-8-sig')
                 if not raw.startswith('WEBVTT'): raise DownloadError('VTT 格式错误')
                 lines, images = raw.splitlines(), {}
                 for i,line in enumerate(lines):
@@ -987,8 +1279,10 @@ class DownloadManager:
                     remote = urljoin(base,reference.split('#',1)[0])
                     if remote not in images:
                         number = len(images) + 1
-                        stem = 'preview' if number == 1 else f'preview-{number:03d}'
-                        _, name = save(remote,stem+'.asset',image=True)
+                        # Keep every VTT sprite beside the video, with names that
+                        # cannot collide with the ordinary preview image.
+                        stem = f'vtt-preview-{number:03d}'
+                        _, name = save(remote,stem+'.asset',image=True,resource_type='vtt_image')
                         images[remote]=name
                     lines[i+1] = images[remote] + ('#'+reference.split('#',1)[1] if '#' in reference else '')
                 self.file_downloader.save(folder/'preview.vtt','\n'.join(lines).encode())
