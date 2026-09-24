@@ -63,14 +63,14 @@ class MediaPreviewGenerator:
     @staticmethod
     def _hover_segments(duration):
         if not duration or duration <= 0:
-            return [(0.0, 6.0)]
+            return [(0.0, 3.0)]
         if duration < 8:
-            return [(0.0, max(0.5, min(duration, 6.0)))]
+            return [(0.0, max(0.5, min(duration, 3.0)))]
         if duration < 30:
-            length = min(1.5, max(0.8, duration / 8))
+            length = min(3.0, duration)
             return [(min(duration * fraction, max(duration - length, 0)), length)
                     for fraction in (0.15, 0.45, 0.75)]
-        return [(min(duration * fraction, duration - 1.5), 1.5)
+        return [(min(duration * fraction, duration - 3.0), 3.0)
                 for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)]
 
     def hover(self, source, directory, duration):

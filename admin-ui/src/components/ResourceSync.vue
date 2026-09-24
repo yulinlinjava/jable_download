@@ -5,7 +5,7 @@ import { api } from '../api'
 
 interface SyncSite {
   id: string; name: string; enabled: boolean; endpoint_url: string; auth_type: string
-  header_name: string; has_secret: boolean; batch_size: number; timeout: number
+  header_name: string; has_secret: boolean; resolve_media?: boolean; batch_size: number; timeout: number
   created_at: number; updated_at: number
 }
 
@@ -16,7 +16,12 @@ const loading = ref(false), saving = ref(false), syncing = ref(false)
 const sites = ref<SyncSite[]>([]), runs = ref<any[]>([])
 const selectedSiteId = ref(''), editorVisible = ref(false), editingId = ref('')
 const form = reactive({ name: '', enabled: true, endpoint_url: '', auth_type: 'none', header_name: 'X-API-Key', secret: '', has_secret: false, batch_size: 50, timeout: 30 })
-const enabledSites = computed(() => sites.value.filter(site => site.enabled))
+const regularSites = computed(() => sites.value.filter(site => !site.resolve_media))
+const enabledSites = computed(() => regularSites.value.filter(site => site.enabled))
+const visibleRuns = computed(() => {
+  const siteIds = new Set(regularSites.value.map(site => site.id))
+  return runs.value.filter(run => siteIds.has(run.site_id))
+})
 const formatTime = (value?: number) => value ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
 const statusText = (value: string) => ({ completed: '成功', failed: '失败', running: '同步中' }[value] || value)
 const statusType = (value: string) => value === 'completed' ? 'success' : value === 'failed' ? 'danger' : 'primary'
@@ -46,7 +51,7 @@ async function saveSite() {
   if (!form.endpoint_url.trim()) return ElMessage.warning('请输入同步接口地址')
   saving.value = true
   try {
-    const data = { name: form.name.trim(), enabled: form.enabled, endpoint_url: form.endpoint_url.trim(), auth_type: form.auth_type, header_name: form.header_name, secret: form.secret || null, batch_size: form.batch_size, timeout: form.timeout }
+    const data = { name: form.name.trim(), enabled: form.enabled, endpoint_url: form.endpoint_url.trim(), auth_type: form.auth_type, header_name: form.header_name, secret: form.secret || null, resolve_media: false, batch_size: form.batch_size, timeout: form.timeout }
     editingId.value ? await api.put(`/resource-sync/sites/${editingId.value}`, data) : await api.post('/resource-sync/sites', data)
     ElMessage.success(editingId.value ? '网站已更新' : '网站已添加')
     editorVisible.value = false
@@ -84,13 +89,14 @@ watch(visible, value => { if (value) load() })
 </script>
 
 <template>
-  <el-dialog v-model="visible" title="第三方网站管理" width="min(1100px, 96vw)" :close-on-click-modal="false">
+  <el-dialog v-model="visible" title="发送数据" width="min(1100px, 96vw)" :close-on-click-modal="false">
     <div v-loading="loading">
+      <el-alert type="info" :closable="false" show-icon title="仅发送已经下载完成的资源；“全部同步”也会自动排除待下载、下载中和失败资源。"/>
       <div class="site-toolbar">
         <div><strong>同步网站</strong><div class="secondary-cell">维护多个接收资源的第三方接口，同步时选择目标网站。</div></div>
         <el-button type="primary" @click="createSite">添加网站</el-button>
       </div>
-      <el-table :data="sites" max-height="260" empty-text="还没有第三方网站，请先添加">
+      <el-table :data="regularSites" max-height="260" empty-text="还没有第三方网站，请先添加">
         <el-table-column prop="name" label="网站名称" min-width="130"/>
         <el-table-column label="状态" width="85"><template #default="{row}"><el-tag :type="row.enabled?'success':'info'">{{row.enabled?'已启用':'已停用'}}</el-tag></template></el-table-column>
         <el-table-column prop="endpoint_url" label="同步接口" min-width="280" show-overflow-tooltip/>
@@ -110,7 +116,7 @@ watch(visible, value => { if (value) load() })
       </div>
 
       <el-divider content-position="left">最近同步记录</el-divider>
-      <el-table :data="runs" max-height="300" empty-text="暂无同步记录">
+      <el-table :data="visibleRuns" max-height="300" empty-text="暂无同步记录">
         <el-table-column label="时间" width="175"><template #default="{row}">{{formatTime(row.created)}}</template></el-table-column>
         <el-table-column prop="site_name" label="目标网站" min-width="130"><template #default="{row}">{{row.site_name || '历史配置'}}</template></el-table-column>
         <el-table-column label="范围" width="90"><template #default="{row}">{{row.scope==='all'?'全部':'已选择'}}</template></el-table-column>

@@ -3,22 +3,47 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { Film } from '@element-plus/icons-vue'
 import Hls from 'hls.js'
 
-const props = defineProps<{ cover?: string; preview?: string; previewHls?: string }>()
-const failed = ref(false), previewFailed = ref(false), hlsFailed = ref(false), hovering = ref(false)
+const props = defineProps<{
+  cover?: string; preview?: string; previewHls?: string
+  fallbackCover?: string; fallbackPreview?: string; fallbackPreviewHls?: string
+}>()
+const failed = ref(false), coverFallback = ref(false), previewFallback = ref(false)
+const previewFailed = ref(false), hlsFailed = ref(false), hovering = ref(false)
 const video = ref<HTMLVideoElement>()
 let hls: Hls | undefined
-const source = computed(() => props.cover || '')
-const previewSource = computed(() => props.preview || '')
-const hlsSource = computed(() => props.previewHls || '')
+const source = computed(() => coverFallback.value ? (props.fallbackCover || '') : (props.cover || ''))
+const previewSource = computed(() => previewFallback.value ? (props.fallbackPreview || '') : (props.preview || ''))
+const hlsSource = computed(() => previewFallback.value ? (props.fallbackPreviewHls || '') : (props.previewHls || ''))
 const useHls = computed(() => Boolean(hlsSource.value && !hlsFailed.value))
 const previewIsVideo = computed(() => useHls.value || /\.(mp4|webm)(?:\?|$)/i.test(previewSource.value))
 const hasPreview = computed(() => Boolean(hlsSource.value || previewSource.value))
-watch(source, () => { failed.value = false })
-watch([previewSource, hlsSource], () => {
+watch(() => [props.cover, props.fallbackCover], () => { failed.value = false; coverFallback.value = false })
+watch(() => [props.preview, props.previewHls, props.fallbackPreview, props.fallbackPreviewHls], () => {
   stopVideo()
+  previewFallback.value = false
   previewFailed.value = false
   hlsFailed.value = false
 })
+
+function coverError() {
+  if (!coverFallback.value && props.fallbackCover && props.fallbackCover !== props.cover) {
+    coverFallback.value = true
+    return
+  }
+  failed.value = true
+}
+
+async function tryPreviewFallback() {
+  if (!previewFallback.value && (props.fallbackPreview || props.fallbackPreviewHls)) {
+    stopVideo()
+    previewFallback.value = true
+    previewFailed.value = false
+    hlsFailed.value = false
+    await enter()
+    return true
+  }
+  return false
+}
 
 function stopVideo() {
   hls?.destroy()
@@ -33,7 +58,7 @@ function stopVideo() {
 async function playFallback() {
   await nextTick()
   if (previewIsVideo.value && !previewFailed.value) {
-    video.value?.play().catch(() => { previewFailed.value = true })
+    video.value?.play().catch(async () => { if (!await tryPreviewFallback()) previewFailed.value = true })
   }
 }
 
@@ -49,7 +74,7 @@ async function enter() {
         if (!data.fatal) return
         hls?.destroy(); hls = undefined; hlsFailed.value = true
         if (previewSource.value) playFallback()
-        else previewFailed.value = true
+        else tryPreviewFallback().then(switched => { if (!switched) previewFailed.value = true })
       })
       hls.loadSource(hlsSource.value)
       hls.attachMedia(video.value)
@@ -57,7 +82,7 @@ async function enter() {
     }
     if (video.value.canPlayType('application/vnd.apple.mpegurl')) {
       video.value.src = hlsSource.value
-      video.value.play().catch(() => { hlsFailed.value = true; playFallback() })
+      video.value.play().catch(async () => { hlsFailed.value = true; if (previewSource.value) await playFallback(); else if (!await tryPreviewFallback()) previewFailed.value = true })
       return
     }
     hlsFailed.value = true
@@ -73,11 +98,11 @@ onBeforeUnmount(stopVideo)
 
 <template>
   <div class="download-thumb" @mouseenter="enter" @mouseleave="leave">
-    <img v-if="source && !failed" class="thumb-poster" :src="source" alt="" @error="failed=true">
+    <img v-if="source && !failed" class="thumb-poster" :src="source" alt="" @error="coverError">
     <Film v-else class="thumb-placeholder" />
     <template v-if="hovering && hasPreview && !previewFailed">
-      <video v-if="previewIsVideo" ref="video" class="thumb-preview" :src="useHls ? undefined : previewSource" muted loop playsinline preload="metadata" @error="previewFailed=true"/>
-      <img v-else class="thumb-preview" :src="previewSource" alt="" @error="previewFailed=true"/>
+      <video v-if="previewIsVideo" ref="video" class="thumb-preview" :src="useHls ? undefined : previewSource" muted loop playsinline preload="metadata" @error="tryPreviewFallback().then(switched => { if (!switched) previewFailed=true })"/>
+      <img v-else class="thumb-preview" :src="previewSource" alt="" @error="tryPreviewFallback().then(switched => { if (!switched) previewFailed=true })"/>
     </template>
     <span v-if="hasPreview" class="preview-badge">预览</span>
   </div>

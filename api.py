@@ -65,26 +65,45 @@ async def lifespan(app):
     from download_signers import DownloadSignerManager
     from import_scripts import ImportScriptManager
     from resource_sync import ResourceSyncManager
+    from r2_sync import R2SyncManager
+    from system_monitor import SystemMonitor
     app.state.downloads = DownloadManager(DOWNLOAD_ROOT, start_enabled=False)
     app.state.download_signers = DownloadSignerManager(app.state.downloads.database)
     app.state.downloads.signers = app.state.download_signers
-    app.state.uploads = UploadManager(DOWNLOAD_ROOT, app.state.downloads.database)
+    app.state.r2_sync = R2SyncManager(DOWNLOAD_ROOT, app.state.downloads.database)
+    app.state.downloads.completion_callback = app.state.r2_sync.enqueue_download
+    app.state.uploads = UploadManager(
+        DOWNLOAD_ROOT, app.state.downloads.database,
+        public_base_url_getter=lambda: app.state.downloads.public_base_url,
+        completion_callback=app.state.r2_sync.enqueue_upload)
+    app.state.r2_sync.request_backfill()
+    app.state.system_monitor = SystemMonitor(
+        DOWNLOAD_ROOT, app.state.downloads.database,
+        runtime_provider=app.state.uploads.ffmpeg_runtime_processes)
     def collect(url):
         source, final_url = fetch_page(url)
         return list_data(source, final_url, list_page(final_url))
-    app.state.collections = CollectionManager(DOWNLOAD_ROOT, app.state.downloads, collect)
+    app.state.collections = CollectionManager(
+        DOWNLOAD_ROOT, app.state.downloads, collect, auto_start=False)
     app.state.import_scripts = ImportScriptManager(app.state.downloads.database)
-    app.state.resource_sync = ResourceSyncManager(app.state.downloads.database,
-                                                  app.state.collections.export_items)
+    app.state.resource_sync = ResourceSyncManager(
+        app.state.downloads.database, app.state.collections.export_items,
+        resolve_resource_for_sync)
+    app.state.collections.node_enqueue_callback = app.state.resource_sync.enqueue_node_items
+    app.state.collections.start()
     try:
         yield
     finally:
+        app.state.system_monitor.close()
+        app.state.resource_sync.close()
         await __import__('asyncio').to_thread(app.state.collections.close)
-        await __import__('asyncio').to_thread(app.state.downloads.close)
         app.state.uploads.close()
+        app.state.r2_sync.close()
+        await __import__('asyncio').to_thread(app.state.downloads.close)
+        await __import__('asyncio').to_thread(close_browser_session)
 
 
-app = FastAPI(title='JableTVDownload API', version='1.2.0', lifespan=lifespan)
+app = FastAPI(title='JableTVDownload API', version='1.3.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=['*'],
                    allow_methods=['*'], allow_headers=['Range', 'Content-Type', 'X-API-Key'],
                    expose_headers=['Accept-Ranges', 'Content-Length', 'Content-Range'])
@@ -99,21 +118,83 @@ for public_path, relative_path in (
               name='media-' + public_path.lstrip('/'))
 key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 browser_slot = threading.BoundedSemaphore(1)
+browser_state_lock = threading.RLock()
+browser_driver = None
+browser_cookies = ()
+browser_user_agent = None
+
+
+def _discard_browser():
+    global browser_driver
+    current, browser_driver = browser_driver, None
+    if current is not None:
+        try:
+            current.quit()
+        except Exception:
+            pass
+
+
+def _persistent_browser():
+    global browser_driver
+    from crawler import initWebDriver
+    if browser_driver is not None:
+        try:
+            browser_driver.execute_script('return 1')
+            return browser_driver
+        except Exception:
+            _discard_browser()
+    browser_driver = initWebDriver()
+    browser_driver.set_page_load_timeout(TIMEOUT)
+    return browser_driver
+
+
+def _remember_browser_state(driver):
+    global browser_cookies, browser_user_agent
+    try:
+        cookies = tuple(driver.get_cookies())
+        user_agent = driver.execute_script('return navigator.userAgent')
+    except Exception:
+        return
+    with browser_state_lock:
+        browser_cookies = cookies
+        browser_user_agent = str(user_agent or '') or None
+
+
+def _apply_browser_state(session, url):
+    hostname = urlsplit(url).hostname or ''
+    with browser_state_lock:
+        cookies, user_agent = browser_cookies, browser_user_agent
+    if user_agent:
+        session.headers['User-Agent'] = user_agent
+    for cookie in cookies:
+        domain = str(cookie.get('domain') or hostname)
+        if hostname != domain.lstrip('.') and not hostname.endswith('.' + domain.lstrip('.')):
+            continue
+        try:
+            session.cookies.set(cookie['name'], cookie['value'], domain=domain,
+                                path=cookie.get('path') or '/')
+        except (KeyError, TypeError, ValueError):
+            continue
+
+
+def close_browser_session():
+    if browser_slot.acquire(timeout=5):
+        try:
+            _discard_browser()
+        finally:
+            browser_slot.release()
 
 
 def fetch_browser_page(url, detail=False):
-    """Use the project's ordinary browser when HTTP receives a challenge."""
-    from crawler import initWebDriver
+    """Reuse one verified browser when HTTP receives a challenge."""
     from selenium.common.exceptions import TimeoutException, WebDriverException
     from selenium.webdriver.support.ui import WebDriverWait
 
     url = validate_url(url, detail)
     if not browser_slot.acquire(timeout=TIMEOUT):
         raise APIError(503, 50301, '浏览器抓取繁忙，请稍后重试')
-    driver = None
     try:
-        driver = initWebDriver()
-        driver.set_page_load_timeout(TIMEOUT)
+        driver = _persistent_browser()
         driver.get(url)
         def ready(browser):
             validate_url(browser.current_url, detail)
@@ -123,17 +204,16 @@ def fetch_browser_page(url, detail=False):
                     else list_data(source, browser.current_url, 1)['items'])
         WebDriverWait(driver, TIMEOUT).until(ready)
         final_url = validate_url(driver.current_url, detail)
+        _remember_browser_state(driver)
         return driver.page_source, final_url
     except TimeoutException:
+        _discard_browser()
         raise APIError(502, 50203, '浏览器未能加载视频数据，来源可能仍要求验证或页面结构已变化')
     except WebDriverException:
+        _discard_browser()
         raise APIError(502, 50204, '浏览器抓取失败，请检查 Chromium 和 ChromeDriver 安装及服务日志')
     finally:
-        try:
-            if driver is not None:
-                driver.quit()
-        finally:
-            browser_slot.release()
+        browser_slot.release()
 
 
 class APIError(Exception):
@@ -165,6 +245,7 @@ class Detail(Video):
     actors: list[str]
     tags: list[str]
     m3u8_url: str
+    chapters: list[dict] = Field(default_factory=list)
 
 
 class Page(BaseModel):
@@ -219,6 +300,25 @@ def authorize(key: str | None = Security(key_header)):
 @app.get('/api/auth/check', dependencies=[Depends(authorize)])
 def auth_check():
     return dict(code=0, message='ok', data=dict(authenticated=True))
+
+
+@app.get('/api/system/metrics', dependencies=[Depends(authorize)])
+def system_metrics(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.system_monitor.current())
+
+
+@app.get('/api/system/metrics/history', dependencies=[Depends(authorize)])
+def system_metrics_history(request: Request,
+                           minutes: int = Query(60, ge=1, le=4320)):
+    return dict(
+        code=0, message='ok', data=request.app.state.system_monitor.history(minutes))
+
+
+@app.get('/api/system/ffmpeg-processes', dependencies=[Depends(authorize)])
+def system_ffmpeg_processes(request: Request):
+    return dict(
+        code=0, message='ok',
+        data={'items': request.app.state.system_monitor.ffmpeg_processes()})
 
 
 def media_signature(task_id, expires):
@@ -328,11 +428,13 @@ def fetch_page(url, detail=False):
     deadline = time.monotonic() + TIMEOUT
     try:
         with requests.Session() as session:
+            session.headers.update(headers)
+            _apply_browser_state(session, url)
             for _ in range(6):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise requests.Timeout()
-                with session.get(url, headers=headers, timeout=remaining, allow_redirects=False, stream=True) as response:
+                with session.get(url, timeout=remaining, allow_redirects=False, stream=True) as response:
                     if response.status_code in (301, 302, 303, 307, 308):
                         target = response.headers.get('Location')
                         try:
@@ -394,15 +496,47 @@ def latest(page: int = Query(1, ge=1), url: str | None = Query(None, max_length=
 
 @app.get('/api/detail', response_model=DetailResponse, dependencies=[Depends(authorize)])
 def detail(url: str = Query(..., max_length=2048)):
+    return dict(code=0, message='ok', data=resolve_detail(url))
+
+
+def resolve_detail(url):
     source, final_url = fetch_page(url, detail=True)
     result = detail_data(source, final_url)
-    if provider(final_url) == '123av' and not result['m3u8_url']:
-        players = provider_123av.player_urls(source)
-        if players:
-            result['m3u8_url'] = resolve_player(players[0], preview=result)
+    if provider(final_url) == '123av':
+        chapters = result.get('chapters') or []
+        resolved = []
+        for chapter in chapters:
+            current = dict(chapter)
+            preview = {}
+            current['m3u8_url'] = resolve_player(current.pop('player_url'), preview=preview)
+            current['vtt_url'] = preview.get('vtt_url')
+            current['has_vtt'] = preview.get('has_vtt')
+            resolved.append(current)
+        result['chapters'] = resolved
+        if resolved:
+            result['m3u8_url'] = resolved[0]['m3u8_url']
+            result['vtt_url'] = resolved[0].get('vtt_url')
+            result['has_vtt'] = resolved[0].get('has_vtt')
     if not result['m3u8_url']:
         raise APIError(502, 50202, '未解析到播放地址，页面结构可能变化或访问受限')
-    return dict(code=0, message='ok', data=result)
+    return result
+
+
+def resolve_resource_for_sync(item):
+    """Resolve fresh remote media locally before handing a resource to a download node."""
+    if item.get('source') not in ('jable', '123av') and item.get('m3u8_url'):
+        return item
+    url = item.get('url')
+    if not url:
+        if item.get('m3u8_url'):
+            return item
+        raise APIError(400, 40002, '资源缺少详情页地址，无法在本地解析播放链接')
+    detail = resolve_detail(url)
+    for field in ('title', 'cover', 'poster', 'preview_image', 'vtt_url', 'duration',
+                  'published_at', 'actors', 'tags', 'm3u8_url', 'chapters'):
+        if detail.get(field) not in (None, '', []):
+            item[field] = detail[field]
+    return item
 
 
 class DownloadInput(BaseModel):
@@ -415,6 +549,11 @@ class DownloadTask(BaseModel):
     video_id: str
     url: str
     status: str
+    r2_synced: bool = False
+    r2_sync_status: str = 'unsynced'
+    r2_synced_at: float | None = None
+    local_deleted: bool = False
+    local_deleted_at: float | None = None
     downloaded_segments: int
     total_segments: int
     downloaded_bytes: int
@@ -433,6 +572,7 @@ class DownloadTask(BaseModel):
     preview_m3u8_url: str | None = None
     preview5_m3u8_file: str | None = None
     preview5_m3u8_url: str | None = None
+    chapters: list[dict] = Field(default_factory=list)
     message: str | None = None
     error: str | None
     warnings: list[str]
@@ -553,6 +693,9 @@ class CollectionInput(BaseModel):
     url: str = Field(min_length=1, max_length=2048, description='Jable 或 123AV 列表页链接')
     batch_size: int = Field(1, ge=1, le=20, description='兼容字段；列表采集始终保存当前页全部数据')
     scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
+    r2_sync_enabled: bool = Field(False, description='资源下载完成后自动同步到R2')
+    node_ids: list[str] = Field(default_factory=list, max_length=20,
+                                description='采集成功后立即调度到这些下载节点')
 
 
 class CollectionBulkInput(BaseModel):
@@ -562,6 +705,9 @@ class CollectionBulkInput(BaseModel):
     start_page: int = Field(ge=1, le=100000)
     end_page: int = Field(ge=1, le=100000)
     scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
+    r2_sync_enabled: bool = Field(False, description='资源下载完成后自动同步到R2')
+    node_ids: list[str] = Field(default_factory=list, max_length=20,
+                                description='所有批量任务共用的下载节点')
 
 
 class CollectionTask(BaseModel):
@@ -570,11 +716,16 @@ class CollectionTask(BaseModel):
     url: str
     batch_size: int
     scheduled_enabled: bool = False
+    r2_sync_enabled: bool = False
+    node_ids: list[str] = Field(default_factory=list)
     last_scheduled_date: str | None = None
     status: str
     last_total: int
     last_created: int
     last_skipped: int
+    last_node_queued: int = 0
+    last_node_skipped: int = 0
+    last_node_failed: int = 0
     last_task_ids: list[str]
     last_error: str | None
     last_run_at: float | None
@@ -586,21 +737,47 @@ def collection_url(url):
     return validate_url(url)
 
 
+def collection_node_ids(request, node_ids):
+    from resource_sync import SyncError
+    try:
+        return request.app.state.resource_sync.validate_node_ids(node_ids)
+    except SyncError as exc:
+        raise APIError(400, 40031, str(exc)) from None
+
+
 @app.get('/api/collections', dependencies=[Depends(authorize)])
-def collection_list(request: Request):
-    return dict(code=0, message='ok', data=request.app.state.collections.list())
+def collection_list(request: Request, page: int = Query(1, ge=1),
+                    page_size: int = Query(20, ge=1, le=100),
+                    keyword: str | None = Query(None, max_length=2048),
+                    status: str | None = Query(None),
+                    scheduled_enabled: bool | None = Query(None),
+                    source: str | None = Query(None)):
+    if status and status not in {'idle', 'queued', 'running'}:
+        raise APIError(400, 40001, '采集任务状态筛选参数无效')
+    if source and source not in {'jable', '123av', 'other'}:
+        raise APIError(400, 40001, '采集任务来源筛选参数无效')
+    result = request.app.state.collections.list(
+        page, page_size, keyword.strip() if keyword else None,
+        status, scheduled_enabled, source)
+    request.app.state.resource_sync.attach_collection_nodes(result['items'])
+    return dict(code=0, message='ok', data=result)
 
 
 @app.post('/api/collections', dependencies=[Depends(authorize)])
 def collection_create(body: CollectionInput, request: Request):
+    if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+        raise APIError(400, 40030, '请先配置并启用R2')
     url = collection_url(body.url)
     name = (body.name or '').strip() or f'{provider(url)} 列表采集'
+    node_ids = collection_node_ids(request, body.node_ids)
     return dict(code=0, message='ok', data=request.app.state.collections.create(
-        name, url, body.batch_size, body.scheduled_enabled))
+        name, url, body.batch_size, body.scheduled_enabled, body.r2_sync_enabled, node_ids))
 
 
 @app.post('/api/collections/bulk-create', dependencies=[Depends(authorize)])
 def collection_bulk_create(body: CollectionBulkInput, request: Request):
+    if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+        raise APIError(400, 40030, '请先配置并启用R2')
     if '${page}' not in body.url_template:
         raise APIError(400, 40007, '批量链接模板必须包含 ${page}')
     if body.end_page < body.start_page:
@@ -608,12 +785,14 @@ def collection_bulk_create(body: CollectionBulkInput, request: Request):
     if body.end_page - body.start_page + 1 > 500:
         raise APIError(400, 40007, '单次最多批量添加 500 页')
     base_name = (body.name or '').strip()
+    node_ids = collection_node_ids(request, body.node_ids)
     tasks = []
     for page in range(body.start_page, body.end_page + 1):
         url = collection_url(body.url_template.replace('${page}', str(page)))
         prefix = base_name or f'{provider(url)} 列表采集'
         tasks.append(dict(page=page, name=f'{prefix} - 第 {page} 页', url=url))
-    result = request.app.state.collections.create_many(tasks, body.scheduled_enabled)
+    result = request.app.state.collections.create_many(
+        tasks, body.scheduled_enabled, body.r2_sync_enabled, node_ids)
     return dict(code=0, message='ok', data=result)
 
 
@@ -621,9 +800,13 @@ def collection_bulk_create(body: CollectionBulkInput, request: Request):
 def collection_update(task_id: str, body: CollectionInput, request: Request):
     from collection_tasks import CollectionError
     try:
+        if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+            raise APIError(400, 40030, '请先配置并启用R2')
         result = request.app.state.collections.update(task_id, (body.name or '').strip() or '列表采集',
                                                       collection_url(body.url), body.batch_size,
-                                                      body.scheduled_enabled)
+                                                      body.scheduled_enabled,
+                                                      body.r2_sync_enabled,
+                                                      collection_node_ids(request, body.node_ids))
     except CollectionError as exc:
         raise APIError(409, 40902, str(exc))
     if result is None:
@@ -675,6 +858,12 @@ def collection_bulk_execute(body: BulkIdsInput, request: Request):
     return dict(code=0, message='queued', data=request.app.state.collections.execute_many(body.ids))
 
 
+@app.post('/api/collections/bulk-delete', dependencies=[Depends(authorize)])
+def collection_bulk_delete(body: BulkIdsInput, request: Request):
+    result = request.app.state.collections.delete_many(body.ids)
+    return dict(code=0, message='deleted', data=result)
+
+
 @app.delete('/api/collections/{task_id}', dependencies=[Depends(authorize)])
 def collection_delete(task_id: str, request: Request):
     from collection_tasks import CollectionError
@@ -698,6 +887,8 @@ def collection_item_list(request: Request, page: int = Query(1, ge=1),
     if status and status not in {'pending', 'queued', 'downloading', 'completed', 'failed'}:
         raise APIError(400, 40001, '资源状态筛选参数无效')
     result = request.app.state.collections.list_items(page, page_size, title, source, status, collection_id)
+    request.app.state.resource_sync.attach_node_statuses(result['items'])
+    result['node_queue'] = request.app.state.resource_sync.node_queue_summary()
     return dict(code=0, message='ok', data=result)
 
 
@@ -847,16 +1038,40 @@ def collection_item_download_all(request: Request):
 class SchedulerSettingsInput(BaseModel):
     enabled: bool
     concurrency: int = Field(1, ge=1, le=10)
+    segment_concurrency: int = Field(3, ge=1, le=16)
+
+
+class PublicBaseUrlInput(BaseModel):
+    url: str = Field(min_length=1, max_length=2048,
+                     description='公开访问根地址，例如 http://localhost:8000')
 
 
 @app.get('/api/settings/scheduler', dependencies=[Depends(authorize)])
 def scheduler_settings(request: Request):
-    return dict(code=0, message='ok', data=request.app.state.collections.settings())
+    result = request.app.state.collections.settings()
+    result['upload_speed'] = request.app.state.r2_sync.upload_speed()
+    return dict(code=0, message='ok', data=result)
 
 
 @app.put('/api/settings/scheduler', dependencies=[Depends(authorize)])
 def scheduler_settings_update(body: SchedulerSettingsInput, request: Request):
-    result = request.app.state.collections.update_settings(body.enabled, body.concurrency)
+    result = request.app.state.collections.update_settings(
+        body.enabled, body.concurrency, body.segment_concurrency)
+    result['upload_speed'] = request.app.state.r2_sync.upload_speed()
+    return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/settings/public-url', dependencies=[Depends(authorize)])
+def public_url_settings(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.downloads.public_url_settings())
+
+
+@app.put('/api/settings/public-url', dependencies=[Depends(authorize)])
+def public_url_settings_update(body: PublicBaseUrlInput, request: Request):
+    try:
+        result = request.app.state.downloads.set_public_base_url(body.url)
+    except ValueError as exc:
+        raise APIError(400, 40010, str(exc)) from None
     return dict(code=0, message='ok', data=result)
 
 
@@ -867,6 +1082,7 @@ class ResourceSyncSiteInput(BaseModel):
     auth_type: str = Field('none', max_length=20)
     header_name: str = Field('X-API-Key', max_length=64)
     secret: str | None = Field(None, max_length=4096)
+    resolve_media: bool = False
     batch_size: int = Field(50, ge=1, le=100)
     timeout: int = Field(30, ge=5, le=120)
 
@@ -875,6 +1091,15 @@ class ResourceSyncExecuteInput(BaseModel):
     site_id: str = Field(min_length=32, max_length=32)
     ids: list[str] = Field(default_factory=list, max_length=10000)
     all: bool = False
+
+
+class ResourceSyncRecordRetryInput(BaseModel):
+    ids: list[str] = Field(default_factory=list, max_length=10000)
+    all: bool = False
+
+
+class ResourceSyncRecordDeleteInput(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=10000)
 
 
 @app.get('/api/resource-sync/sites', dependencies=[Depends(authorize)])
@@ -888,7 +1113,7 @@ def resource_sync_site_create(body: ResourceSyncSiteInput, request: Request):
     try:
         result = request.app.state.resource_sync.create_site(
             body.name, body.enabled, body.endpoint_url, body.auth_type,
-            body.header_name, body.secret, body.batch_size, body.timeout)
+            body.header_name, body.secret, body.batch_size, body.timeout, body.resolve_media)
     except SyncError as exc:
         raise APIError(400, 40006, str(exc))
     return dict(code=0, message='created', data=result)
@@ -902,7 +1127,7 @@ def resource_sync_site_update(site_id: str, body: ResourceSyncSiteInput, request
     try:
         result = request.app.state.resource_sync.update_site(
             site_id, body.name, body.enabled, body.endpoint_url, body.auth_type,
-            body.header_name, body.secret, body.batch_size, body.timeout)
+            body.header_name, body.secret, body.batch_size, body.timeout, body.resolve_media)
     except SyncError as exc:
         raise APIError(400, 40006, str(exc))
     return dict(code=0, message='ok', data=result)
@@ -945,19 +1170,168 @@ def resource_sync_retry(run_id: str, request: Request):
     return dict(code=0, message='ok', data=result)
 
 
+@app.get('/api/resource-sync/records', dependencies=[Depends(authorize)])
+def resource_sync_records(request: Request, page: int = Query(1, ge=1),
+                          page_size: int = Query(20, ge=1, le=100),
+                          keyword: str | None = Query(None, max_length=200),
+                          status: str | None = Query(None, max_length=20),
+                          site_id: str | None = Query(None, min_length=32, max_length=32)):
+    from resource_sync import SyncError
+    try:
+        result = request.app.state.resource_sync.list_records(
+            page, page_size, keyword, status, site_id)
+    except SyncError as exc:
+        raise APIError(400, 40009, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/resource-sync/records/retry', dependencies=[Depends(authorize)])
+def resource_sync_record_retry(body: ResourceSyncRecordRetryInput, request: Request):
+    from resource_sync import SyncError
+    if not body.all and not body.ids:
+        raise APIError(400, 40009, '请选择要重试的失败记录')
+    try:
+        result = request.app.state.resource_sync.retry_records(body.ids, body.all)
+    except SyncError as exc:
+        raise APIError(409, 40909, str(exc))
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/resource-sync/records/delete', dependencies=[Depends(authorize)])
+def resource_sync_record_delete(body: ResourceSyncRecordDeleteInput, request: Request):
+    from resource_sync import SyncError
+    try:
+        result = request.app.state.resource_sync.delete_records(body.ids)
+    except SyncError as exc:
+        raise APIError(400, 40009, str(exc))
+    return dict(code=0, message='deleted', data=result)
+
+
 class MergeUploadInput(BaseModel):
     identifier: str = Field(min_length=1, max_length=128)
     file_name: str = Field(alias='fileName', min_length=1, max_length=255)
-    total_chunks: int = Field(alias='totalChunks', ge=1)
+    r2_sync_enabled: bool | None = Field(default=None, alias='r2SyncEnabled')
 
 
 class UploadIdsInput(BaseModel):
     identifiers: list[str] = Field(min_length=1, max_length=100)
 
 
+class FfmpegSettingsInput(BaseModel):
+    concurrency: int = Field(ge=0, le=64)
+
+
+class FfmpegCompressionSettingsInput(BaseModel):
+    enabled: bool
+    min_file_size_mb: float = Field(alias='minFileSizeMb', ge=1, le=102400)
+    min_duration_minutes: float = Field(alias='minDurationMinutes', ge=1, le=1440)
+    max_video_bitrate_mbps: float = Field(alias='maxVideoBitrateMbps', ge=0.1, le=100)
+    max_width: int = Field(alias='maxWidth', ge=320, le=7680)
+    max_height: int = Field(alias='maxHeight', ge=240, le=4320)
+    crf: int = Field(ge=0, le=51)
+    preset: str = Field(min_length=4, max_length=16)
+    audio_bitrate_kbps: int = Field(alias='audioBitrateKbps', ge=32, le=512)
+    hls_segment_seconds: int = Field(alias='hlsSegmentSeconds', ge=1, le=30)
+
+
+class R2SettingsInput(BaseModel):
+    enabled: bool = False
+    endpoint_url: str = Field(alias='endpointUrl', max_length=2048)
+    access_key_id: str = Field(alias='accessKeyId', max_length=512)
+    secret_access_key: str | None = Field(default=None, alias='secretAccessKey', max_length=2048)
+    bucket: str = Field(max_length=255)
+    public_base_url: str = Field(default='', alias='publicBaseUrl', max_length=2048)
+    path_prefix: str = Field(default='', alias='pathPrefix', max_length=512)
+    concurrency: int = Field(default=1, ge=0, le=16)
+    file_concurrency: int = Field(default=3, alias='fileConcurrency', ge=1, le=16)
+    auto_upload: bool = Field(default=False, alias='autoUpload')
+    auto_collection: bool = Field(default=False, alias='autoCollection')
+    cleanup_enabled: bool = Field(default=False, alias='cleanupEnabled')
+    retention_days: int = Field(default=7, alias='retentionDays', ge=1, le=3650)
+
+
+class R2TaskIdsInput(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+@app.get('/api/r2/settings', dependencies=[Depends(authorize)])
+def r2_settings(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.r2_sync.settings())
+
+
+@app.put('/api/r2/settings', dependencies=[Depends(authorize)])
+def update_r2_settings(body: R2SettingsInput, request: Request):
+    from r2_sync import R2SyncError
+    try:
+        result = request.app.state.r2_sync.save_settings(body.model_dump())
+    except R2SyncError as exc:
+        raise APIError(400, 40030, str(exc))
+    return dict(code=0, message='saved', data=result)
+
+
+@app.post('/api/r2/settings/test', dependencies=[Depends(authorize)])
+def test_r2_settings(body: R2SettingsInput, request: Request):
+    from r2_sync import R2SyncError
+    try:
+        result = request.app.state.r2_sync.test_settings(body.model_dump())
+    except R2SyncError as exc:
+        raise APIError(400, 40030, str(exc))
+    return dict(code=0, message='connected', data=result)
+
+
+@app.get('/api/r2/tasks', dependencies=[Depends(authorize)])
+def r2_task_list(request: Request, page: int = Query(1, ge=1),
+                 page_size: int = Query(20, ge=1, le=100),
+                 keyword: str | None = Query(None, max_length=255),
+                 status: str | None = Query(None),
+                 resource_type: str | None = Query(None)):
+    if status and status not in {'queued', 'running', 'completed', 'failed'}:
+        raise APIError(400, 40001, 'R2 同步状态筛选参数无效')
+    if resource_type and resource_type not in {'collection', 'upload'}:
+        raise APIError(400, 40001, 'R2资源来源筛选参数无效')
+    result = request.app.state.r2_sync.list_tasks(
+        page, page_size, keyword.strip() if keyword else None, status, resource_type)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/r2/tasks/retry', dependencies=[Depends(authorize)])
+def retry_r2_tasks(body: R2TaskIdsInput, request: Request):
+    result = request.app.state.r2_sync.retry(body.ids)
+    return dict(code=0, message='queued', data=result)
+
+
+@app.post('/api/r2/tasks/delete', dependencies=[Depends(authorize)])
+def delete_r2_tasks(body: R2TaskIdsInput, request: Request):
+    result = request.app.state.r2_sync.delete_tasks(body.ids)
+    return dict(code=0, message='deleted', data=result)
+
+
+@app.post('/api/r2/resources/sync', dependencies=[Depends(authorize)])
+def sync_resources_to_r2(body: R2TaskIdsInput, request: Request):
+    from r2_sync import R2SyncError
+    try:
+        result = request.app.state.r2_sync.enqueue_download_ids(body.ids)
+    except R2SyncError as exc:
+        raise APIError(400, 40030, str(exc))
+    return dict(code=0, message='queued', data=result)
+
+
+@app.post('/api/r2/uploads/sync', dependencies=[Depends(authorize)])
+def sync_uploads_to_r2(body: R2TaskIdsInput, request: Request):
+    from r2_sync import R2SyncError
+    try:
+        result = request.app.state.r2_sync.enqueue_upload_ids(body.ids)
+    except R2SyncError as exc:
+        raise APIError(400, 40030, str(exc))
+    return dict(code=0, message='queued', data=result)
+
+
 @app.post('/upload/file', dependencies=[Depends(authorize)])
-def upload_file(request: Request, file: UploadFile = File(...)):
-    result = request.app.state.uploads.upload_file(file)
+def upload_file(request: Request, file: UploadFile = File(...),
+                r2_sync_enabled: bool = Form(False, alias='r2SyncEnabled')):
+    if r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+        raise APIError(400, 40030, '请先配置并启用R2')
+    result = request.app.state.uploads.upload_file(file, r2_sync_enabled)
     return dict(code=0, message='ok', data=result)
 
 
@@ -970,12 +1344,13 @@ def upload_chunk_status(request: Request, identifier: str = Query(..., min_lengt
 @app.get('/upload/list', dependencies=[Depends(authorize)])
 def upload_list(request: Request, page: int = Query(1, ge=1),
                 page_size: int = Query(20, ge=1, le=100),
-                keyword: str | None = Query(None, max_length=100),
+                keyword: str | None = Query(None, max_length=2048),
                 file_type: str | None = Query(None), status: str | None = Query(None)):
     if file_type and file_type not in {'video', 'image', 'other'}:
         raise APIError(400, 40001, '上传文件类型筛选参数无效')
-    allowed_status = {'uploading', 'merging', 'segmenting', 'generating_cover',
-                      'generating_preview', 'generating_vtt', 'completed', 'failed'}
+    allowed_status = {'uploading', 'merging', 'queued', 'probing', 'compressing',
+                      'segmenting', 'generating_cover', 'generating_preview',
+                      'generating_vtt', 'completed', 'failed', 'cancelled'}
     if status and status not in allowed_status:
         raise APIError(400, 40001, '上传状态筛选参数无效')
     result = request.app.state.uploads.list_uploads(
@@ -983,21 +1358,98 @@ def upload_list(request: Request, page: int = Query(1, ge=1),
     return dict(code=0, message='ok', data=result)
 
 
+@app.get('/api/ffmpeg/tasks', dependencies=[Depends(authorize)])
+def ffmpeg_task_list(request: Request, page: int = Query(1, ge=1),
+                     page_size: int = Query(20, ge=1, le=100),
+                     keyword: str | None = Query(None, max_length=255),
+                     status: str | None = Query(None)):
+    allowed = {'queued', 'running', 'probing', 'compressing', 'segmenting',
+               'generating_cover', 'generating_preview', 'generating_vtt',
+               'completed', 'failed', 'cancelled'}
+    if status and status not in allowed:
+        raise APIError(400, 40001, 'FFmpeg 任务状态筛选参数无效')
+    result = request.app.state.uploads.list_ffmpeg_tasks(
+        page, page_size, keyword.strip() if keyword else None, status)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/ffmpeg/settings', dependencies=[Depends(authorize)])
+def ffmpeg_settings(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.uploads.ffmpeg_settings())
+
+
+@app.put('/api/ffmpeg/settings', dependencies=[Depends(authorize)])
+def update_ffmpeg_settings(body: FfmpegSettingsInput, request: Request):
+    result = request.app.state.uploads.set_ffmpeg_concurrency(body.concurrency)
+    return dict(code=0, message='saved', data=result)
+
+
+@app.get('/api/ffmpeg/compression-settings', dependencies=[Depends(authorize)])
+def ffmpeg_compression_settings(request: Request):
+    return dict(
+        code=0, message='ok', data=request.app.state.uploads.compression_settings())
+
+
+@app.put('/api/ffmpeg/compression-settings', dependencies=[Depends(authorize)])
+def update_ffmpeg_compression_settings(
+        body: FfmpegCompressionSettingsInput, request: Request):
+    result = request.app.state.uploads.set_compression_settings({
+        'enabled': body.enabled, 'minFileSizeMb': body.min_file_size_mb,
+        'minDurationMinutes': body.min_duration_minutes,
+        'maxVideoBitrateMbps': body.max_video_bitrate_mbps,
+        'maxWidth': body.max_width, 'maxHeight': body.max_height,
+        'crf': body.crf, 'preset': body.preset,
+        'audioBitrateKbps': body.audio_bitrate_kbps,
+        'hlsSegmentSeconds': body.hls_segment_seconds,
+    })
+    return dict(code=0, message='saved', data=result)
+
+
+@app.post('/api/ffmpeg/compression-settings/reset', dependencies=[Depends(authorize)])
+def reset_ffmpeg_compression_settings(request: Request):
+    result = request.app.state.uploads.reset_compression_settings()
+    return dict(code=0, message='reset', data=result)
+
+
+@app.post('/api/ffmpeg/tasks/retry', dependencies=[Depends(authorize)])
+def retry_ffmpeg_tasks(body: UploadIdsInput, request: Request):
+    result = request.app.state.uploads.retry_ffmpeg_tasks(body.identifiers)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/ffmpeg/tasks/cancel', dependencies=[Depends(authorize)])
+def cancel_ffmpeg_tasks(body: UploadIdsInput, request: Request):
+    result = request.app.state.uploads.cancel_ffmpeg_tasks(body.identifiers)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.delete('/api/ffmpeg/tasks/{identifier}', dependencies=[Depends(authorize)])
+def delete_ffmpeg_task(identifier: str, request: Request):
+    if not request.app.state.uploads.delete_ffmpeg_task(identifier):
+        raise APIError(409, 40920, '只能删除已完成、失败或已取消的 FFmpeg 任务记录')
+    return dict(code=0, message='deleted', data={'identifier': identifier})
+
+
 @app.post('/upload/chunk', dependencies=[Depends(authorize)])
 def upload_chunk(request: Request,
                  identifier: str = Form(..., min_length=1, max_length=128),
                  chunk_number: int = Form(..., alias='chunkNumber', ge=1),
-                 total_chunks: int | None = Form(None, alias='totalChunks', ge=1),
+                 total_chunks: int = Form(..., alias='totalChunks', ge=1),
+                 r2_sync_enabled: bool = Form(False, alias='r2SyncEnabled'),
                  file: UploadFile = File(...)):
+    if r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+        raise APIError(400, 40030, '请先配置并启用R2')
     result = request.app.state.uploads.upload_chunk(
-        identifier, chunk_number, total_chunks, file)
+        identifier, chunk_number, total_chunks, file, r2_sync_enabled)
     return dict(code=0, message='ok', data=result)
 
 
 @app.post('/upload/merge', dependencies=[Depends(authorize)])
 def merge_upload(request: Request, body: MergeUploadInput):
+    if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
+        raise APIError(400, 40030, '请先配置并启用R2')
     result = request.app.state.uploads.merge(
-        body.identifier, body.file_name, body.total_chunks)
+        body.identifier, body.file_name, body.r2_sync_enabled)
     return dict(code=0, message='ok', data=result)
 
 

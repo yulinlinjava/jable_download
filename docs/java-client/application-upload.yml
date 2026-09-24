@@ -1,0 +1,6 @@
+# JableTVDownload API 地址，不要以 / 结尾。
+remote-upload:
+  base-url: http://43.225.196.162:9178
+  api-key: ${JABLE_UPLOAD_API_KEY:yes@1234}
+  # 完整文件和大分片上传允许较长时间；merge 接口本身会立即返回。
+  request-timeout-minutes: 120

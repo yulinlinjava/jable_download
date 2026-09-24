@@ -42,7 +42,12 @@ def validate_resource(value):
     for field in ('url', 'video_url', 'cover', 'poster', 'preview_image', 'm3u8_url',
                   'vtt_url', 'preview_m3u8_url', 'preview5_m3u8_url'):
         result[field] = resource_url(value.get(field), field)
-    direct_url = result['m3u8_url'] or result['video_url']
+    raw_chapters = value.get('chapters')
+    first_chapter_url = (raw_chapters[0].get('m3u8_url')
+                         if isinstance(raw_chapters, list) and raw_chapters
+                         and isinstance(raw_chapters[0], dict) else None)
+    direct_url = result['m3u8_url'] or result['video_url'] or (
+        resource_url(first_chapter_url, 'chapters[1].m3u8_url') if first_chapter_url else None)
     if not direct_url and result['url'] and urlsplit(result['url']).path.lower().endswith('.m3u8'):
         direct_url = result['url']
     result['m3u8_url'] = direct_url
@@ -67,6 +72,34 @@ def validate_resource(value):
         except ValueError:
             raise ValueError('published_at 必须是有效的 YYYY-MM-DD 日期或 null') from None
     result['published_at'] = published
+    chapters = value.get('chapters', [])
+    if chapters is None:
+        chapters = []
+    if not isinstance(chapters, list) or len(chapters) > 100:
+        raise ValueError('chapters 必须是数组，最多 100 项')
+    normalized = []
+    for index, chapter in enumerate(chapters, 1):
+        if not isinstance(chapter, dict):
+            raise ValueError('chapters 中的每一项必须是对象')
+        stream = resource_url(chapter.get('m3u8_url'), f'chapters[{index}].m3u8_url')
+        if not stream:
+            raise ValueError(f'chapters[{index}].m3u8_url 必填')
+        label = chapter.get('title')
+        if label is not None and (not isinstance(label, str) or len(label.strip()) > 200):
+            raise ValueError(f'chapters[{index}].title 格式无效')
+        normalized.append(dict(index=index, title=label.strip() if label and label.strip() else f'第 {index} 章',
+                               duration=chapter.get('duration') if isinstance(chapter.get('duration'), str) else None,
+                               m3u8_url=stream,
+                               vtt_url=resource_url(chapter.get('vtt_url'), f'chapters[{index}].vtt_url'),
+                               preview_m3u8_url=resource_url(
+                                   chapter.get('preview_m3u8_url'),
+                                   f'chapters[{index}].preview_m3u8_url'),
+                               preview5_m3u8_url=resource_url(
+                                   chapter.get('preview5_m3u8_url'),
+                                   f'chapters[{index}].preview5_m3u8_url')))
+    result['chapters'] = normalized
+    if normalized:
+        result['m3u8_url'] = normalized[0]['m3u8_url']
     # Only server-controlled imports may opt out of the page resolver.
     result['_imported'] = True
     return result

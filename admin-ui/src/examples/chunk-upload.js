@@ -14,12 +14,43 @@ async function apiRequest(path, options = {}) {
   return payload.data
 }
 
-// 只对文件元信息计算哈希，不读取整个大文件。
-// 同一文件再次选择时会得到相同 ID，从而查询并跳过已上传分片。
+// 普通 HTTP 环境的降级方案：仅根据文件元信息生成稳定的 64 位短 ID。
+function createMetadataIdentifier(file) {
+  const bytes = new TextEncoder().encode(`${file.name}\n${file.size}\n${file.lastModified}`)
+  let hash = 0xcbf29ce484222325n
+  for (const byte of bytes) {
+    hash ^= BigInt(byte)
+    hash = BigInt.asUintN(64, hash * 0x100000001b3n)
+  }
+  return hash.toString(16).padStart(16, '0')
+}
+
+// HTTPS/localhost 读取首尾各 16 KiB；普通 HTTP 自动降级为文件元信息计算。
 async function createIdentifier(file) {
-  const text = `${file.name}\n${file.size}\n${file.lastModified}`
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
-  return Array.from(new Uint8Array(digest).slice(0, 8))
+  const subtle = globalThis.crypto?.subtle
+  if (!subtle) return createMetadataIdentifier(file)
+
+  const sampleSize = 16 * 1024
+  const sizeBytes = new TextEncoder().encode(`${file.size}\n`)
+  const samples = file.size <= sampleSize * 2
+    ? [await file.arrayBuffer()]
+    : await Promise.all([
+        file.slice(0, sampleSize).arrayBuffer(),
+        file.slice(file.size - sampleSize).arrayBuffer(),
+      ])
+
+  const length = sizeBytes.byteLength
+    + samples.reduce((total, sample) => total + sample.byteLength, 0)
+  const bytes = new Uint8Array(length)
+  bytes.set(sizeBytes)
+  let offset = sizeBytes.byteLength
+  for (const sample of samples) {
+    bytes.set(new Uint8Array(sample), offset)
+    offset += sample.byteLength
+  }
+
+  const digest = await subtle.digest('SHA-256', bytes)
+  return Array.from(new Uint8Array(digest).subarray(0, 8))
     .map(value => value.toString(16).padStart(2, '0'))
     .join('')
 }
@@ -34,19 +65,15 @@ async function sendChunk(file, identifier, chunkNumber, totalChunks) {
   body.append('identifier', identifier)
   body.append('chunkNumber', String(chunkNumber))
   body.append('totalChunks', String(totalChunks))
-  body.append('file', file.slice(start, Math.min(file.size, start + CHUNK_SIZE)), file.name)
+  body.append('file', file.slice(start, Math.min(file.size, start + CHUNK_SIZE)))
   return apiRequest('/upload/chunk', { method: 'POST', body })
 }
 
-async function submitMerge(file, identifier, totalChunks) {
+async function submitMerge(file, identifier) {
   return apiRequest('/upload/merge', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      identifier,
-      fileName: file.name,
-      totalChunks,
-    }),
+    body: JSON.stringify({ identifier, fileName: file.name }),
   })
 }
 
@@ -61,7 +88,7 @@ async function waitUntilCompleted(identifier, onProgress) {
       percent: status.completed ? 100 : 95,
       message: status.message,
     })
-    if (status.status === 'failed') {
+    if (['failed', 'cancelled'].includes(status.status)) {
       throw new Error(status.error || '后台合并或视频处理失败')
     }
     if (status.completed && status.status === 'completed' && status.path) {
@@ -94,7 +121,7 @@ export async function uploadInChunks(file, onProgress = console.log) {
     })
   }
 
-  const merge = await submitMerge(file, identifier, totalChunks)
+  const merge = await submitMerge(file, identifier)
   onProgress({ stage: merge.processingStage, percent: 95, message: merge.message })
   return waitUntilCompleted(identifier, onProgress)
 }

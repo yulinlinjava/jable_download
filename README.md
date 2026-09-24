@@ -6,27 +6,32 @@
 
 ### Vue 3 管理后台
 
-资源管理支持粘贴 JSON 批量导入：可以直接导入标准数组，也可以选择保存在服务端的 JavaScript 格式化脚本，在浏览器 Worker 中完成字段清洗、链接签名和结果预览；播放地址对应本地公开文件时直接关联，其他远程资源自动加入下载队列。也可导出选中资源并同步到第三方 HTTP 接口。字段示例、脚本格式、去重规则及 API 见 [JSON 资源导入说明](docs/resource-import.md) 和 [资源导出与第三方同步](docs/resource-export-sync.md)。
+资源管理支持粘贴 JSON 批量导入：可以直接导入标准数组，也可以选择保存在服务端的 JavaScript 格式化脚本，在浏览器 Worker 中完成字段清洗、链接签名和结果预览；播放地址对应本地公开文件时直接关联，其他远程资源自动加入下载队列。也可导出选中资源、同步到第三方 HTTP 接口，或在“下载节点”Tab 配置远程节点后，将选中/全部资源加入持久化发送队列。调度接口去重并入队后立即返回，后台逐条获取最新资源数据；每条解析成功后立即单独调用节点 JSON 导入接口，不等待整批资源。调度前按“节点 + 资源番号”查询发送记录，等待、处理中、成功或已重试成功的数据直接跳过，失败记录允许再次发送。服务重启会把未完成记录恢复为等待发送。资源管理页展示等待发送、处理中、成功和失败数量，并在表格显示每条资源的节点及状态。“发送记录”Tab 支持实时状态、搜索、删除、多选重试和全部重试。字段示例、脚本格式、去重规则及 API 见 [JSON 资源导入说明](docs/resource-import.md) 和 [资源导出与第三方同步](docs/resource-export-sync.md)。
 
 启动 API 后打开 `http://localhost:8000/admin`。管理页使用 Vue 3、TypeScript、Vite、Element Plus、Pinia、Vue Router、Plyr 和 Hls.js，提供：
 
-- 新建、编辑、删除和手动执行列表采集任务；支持 Jable 最近更新页与 123AV FC2 列表页。
-- 列表采集任务支持当前表格多选批量执行；每个任务可独立开启“每天 18:00”定时采集，统一使用北京时间。同一天只调度一次，服务在 18:00 后启动时会补执行当天尚未运行的任务。
+- 新建、编辑、删除和手动执行列表采集任务；支持 Jable 最近更新页与 123AV FC2 列表页。新建或编辑时可多选下载节点，每条资源写入本地数据库后立即分别加入所选节点的异步发送队列；节点去重、失败和停用互不影响列表采集及其他节点。
+- 列表采集任务使用后端分页，默认每页 20 条，可按名称或 URL 模糊搜索，并按来源和任务状态筛选；接口同时支持每日定时开关筛选。自动刷新只读取当前页；翻页和刷新保留多选，主动搜索会清空旧选择。筛选栏可批量删除空闲任务，已采集资源会保留，排队或采集中的任务会跳过。每个任务可独立开启“每天 18:00”定时采集，统一使用北京时间。同一天只调度一次，服务在 18:00 后启动时会补执行当天尚未运行的任务。
 - 管理页分为“列表采集”和“资源管理”两个 Tab。资源管理把采集记录与下载任务合并为一张表，每个视频只显示一条，并集中展示状态、进度、文件大小、错误、播放和删除操作；没有采集记录的直接下载任务也会显示。
 - 列表采集只负责保存当前页全部视频信息；有标题时按 NFKC 规范化、合并空白并忽略大小写后去重，无标题时按“来源站点 + 视频标识”去重。采集请求不会等待视频下载。
 - 采集资源支持后端分页（20/50/100 条）、标题模糊搜索、来源与下载状态筛选，并可手动触发单条下载。
 - 采集资源支持当前页多选批量下载；“全部下载”会把所有分页中的待下载资源一次性加入下载任务队列并立即返回。入队不会同步下载，实际执行由全局调度开关和并发数控制。
-- 选中的资源可导出为统一 JSON 文件，字段包含本地或远程 `m3u8_url`、`vtt_url`、封面、演员和标签；支持配置一个第三方接口，按批发送、记录结果并重试失败资源。
-- 全局自动调度默认开启，下载并发数默认 1、可设置为 1—10。关闭后已排队任务继续保留，已经运行的任务继续完成；重新开启后继续消费队列，并发降低时不会强制中断运行中的任务。
+- 选中的资源可导出为统一 JSON 文件，字段包含本地或远程 `m3u8_url`、`vtt_url`、封面、演员和标签；支持配置一个第三方接口，按批发送、记录结果并重试失败资源。“发送数据”只接受已经下载完成的资源，“全部同步”自动排除待下载、下载中和失败资源；“调度至下载节点”仍可发送未下载资源，由远程节点排队下载。
+- 全局自动调度默认开启，下载任务并发数默认1、可设置为1—10；单个任务的TS分片并发默认3、可设置为1—16。密钥和初始化片段先顺序准备，之后并发下载TS；浏览器来源优先为每个线程复用独立HTTP会话，必须回退浏览器时会串行保护WebDriver。关闭调度后已排队任务继续保留，已经运行的任务继续完成；重新开启后继续消费队列，并发降低时不会强制中断运行中的任务。
 - 独立“签名脚本”Tab 可按资源 `source` 配置服务端 JavaScript 签名函数。数据库只保存原始资源地址；M3U8、TS、密钥、封面与 VTT 请求发出前才动态签名，临时 URL 不落库。配置说明见 [下载签名脚本](docs/download-signers.md)。
-- 顶部“实时下载网速”由全局共享的 `FileDownloader` 在内存中汇总所有下载线程收到的字节，按最近 5 秒滑动窗口计算，不依赖数据库进度落库；多任务并发时显示总速度，并在 B/s、KB/s、MB/s、GB/s 之间自动换算。最近 5 秒没有收到数据或服务刚启动尚无采样时显示 `0 B/s`。
+- 顶部同时显示“下载网速”和“上传网速”。下载网速由全局共享的 `FileDownloader` 汇总所有下载线程收到的字节；上传网速由 R2 客户端回调汇总全部同步任务及文件并发上传的字节。两者都在内存中按最近 5 秒滑动窗口计算，不依赖数据库进度落库，并在 B/s、KB/s、MB/s、GB/s 之间自动换算；最近 5 秒没有流量时显示 `0 B/s`。
 - 下载队列、分片进度、文件大小、错误和警告自动刷新。
 - 管理后台只分页请求当前资源页，不再预取 500 条下载任务；顶部数量通过轻量调度状态接口统计，播放优先使用当前资源行中的下载详情。
-- 资源管理表格显示 240×135 封面。已加入下载的资源优先使用本地播放器封面或列表封面，尚未保存本地图片时使用采集记录中的远程封面，失败时显示占位图。鼠标悬浮时优先播放本地最多 3 分钟的 `preview.m3u8`，不可用时回退到 `preview_image.mp4/webm` 或来源预览地址，移出后停止并释放播放器。
+- 资源管理表格显示 240×135 封面。已加入下载的资源优先使用本地播放器封面或列表封面，尚未保存本地图片时使用采集记录中的远程封面，失败时显示占位图。鼠标悬浮时播放 `preview_image.mp4/webm` 或来源提供的 `preview_image`，移出后停止并释放播放器；3 分钟和 5 分钟 HLS 预览作为独立字段供播放器或第三方接口使用。
 - 下载任务按视频 code（`video_id`，忽略大小写）跨来源防重。后台“按番号去重”可清理历史重复数据：每组保留状态最好、更新时间最新的一条，并删除其他任务及其资源。
+- 资源批量删除会拒绝仍在下载的任务；其余资源在 Docker/Linux 中使用系统原生目录删除，并通过一个 SQLite 事务批量清理文件索引和任务记录，避免逐条等待及逐条提交。
 - 点击资源管理中已完成的资源会弹出 Plyr 播放器；Hls.js 播放本地 `index.m3u8`，并加载本地播放器封面、远程采集封面或内置占位封面，以及 `preview.vtt` 进度缩略图。删除本地文件时保留采集记录并恢复为待下载；没有采集记录的直接下载任务会从资源列表移除。启用 API Key 后，播放器会自动申请 6 小时有效的任务级媒体令牌供缩略图使用。
+- 123AV 多章节资源仍保存为一条任务。所有章节按 `01/`、`02/` 等目录依次下载，每章的 TS、`index.m3u8`、`preview.vtt`、`preview.m3u8` 和 `preview5.m3u8` 放在同一章节目录；总进度聚合全部章节，重启后跳过已经完成的分片。任务接口、JSON 导出和节点同步会在 `chapters` 中返回每章自己的 3 分钟及 5 分钟预览地址；根级预览地址、列表封面、悬浮预览和默认播放仍使用第一章节。
 - 管理页打开时必须输入 `X-API-Key` 并通过服务端验证；密钥只保存在当前浏览器的 `localStorage`。右上角钥匙按钮可重新验证密钥。
-- 管理页提供独立的“上传文件”Tab，使用后端分页、文件名搜索、类型与状态筛选展示全部新上传记录，并支持预览、单条删除和批量删除。上传对话框把文件按 10 MiB 分片顺序上传，并在重试时查询和跳过已有分片；完成后可直接预览图片、音频、PDF 和视频，其他文件可下载。“分片上传文档”Tab 提供鉴权说明、接口流程以及可复制的浏览器原生 JavaScript 完整案例。上传视频由服务端 FFmpeg 使用流复制生成 3 秒 VOD HLS，并自动生成列表封面 `cover.jpg`、播放器封面 `poster.jpg`、多时段拼接的悬浮预览 `preview_image.mp4`、进度预览 `preview.vtt` 及雪碧图。全部处理结束后删除合并产生的原视频。
+- 管理页提供独立的“上传文件”Tab，使用后端分页，可按文件名、资源 ID 或任一本地资源 URL 搜索，并支持类型与状态筛选、预览、单条删除和多选批量删除。上传对话框把文件按 10 MiB 分片顺序上传，并在重试时查询和跳过已有分片；完成后可直接预览图片、音频、PDF 和视频，其他文件可下载。“分片上传文档”Tab 提供鉴权说明、接口流程以及可复制的浏览器原生 JavaScript 完整案例。上传视频由服务端 FFmpeg 按需压缩或直接流复制，生成 3 秒 VOD HLS，并自动生成列表封面 `cover.jpg`、播放器封面 `poster.jpg`、多时段拼接的悬浮预览 `preview_image.mp4`、进度预览 `preview.vtt` 及雪碧图。全部处理结束后删除合并产生的原视频。
+- “FFmpeg 任务”Tab 统一展示上传视频的排队、媒体探测、按需压缩、HLS 切片、封面和预览生成进度。一个视频的完整处理流程占用一个并发名额；并发数默认 1，设置为 0 时暂停领取新任务，已经运行的任务继续完成。并发设置和任务记录保存在 SQLite，服务重启会把未完成任务重新排队。页面支持文件名/资源 ID 搜索、状态筛选、多选重试、批量取消排队任务以及删除终态任务记录；删除任务记录不会删除上传资源。并发和压缩参数统一在顶部“系统配置”中修改。
+- “CF R2资源同步日志”Tab 统一展示采集资源、上传资源的后台同步进度。R2连接、公开地址、路径前缀、任务/文件并发、自动同步和本地保留策略统一在顶部“系统配置”中修改。开启全局自动同步后，后台分批补齐全部已完成资源，未来完成的资源自动入队。视频必须等待本地下载或FFmpeg处理完成才会同步整个成品目录；本地下载、上传接口不会等待R2。TS、图片等并发上传完成后才发布VTT和M3U8。采集资源和上传文件直接保存 `r2_sync_status`，状态分为“未同步、同步中、同步完成”；加入队列和失败重试立即进入同步中，成功后进入同步完成，失败回到未同步。可配置从R2实际完成时间起保留本地文件1—3650天，后台每5分钟扫描到期资源，只删除已确认同步完成的本地目录或文件，保留数据库、R2对象和同步日志，并记录本地清理状态。同步完成后管理页优先从R2显示封面、悬浮预览和视频，R2加载失败时自动回退本地地址。任务记录文件数、字节数、公开地址和错误，支持分页搜索、来源与状态筛选、失败重试及批量删除日志。同步任务并发设为0时暂停领取新任务，服务重启会继续未完成任务。Secret Access Key加密保存在现有数据目录；删除日志或本地资源不会删除已经写入R2的对象。
+- 顶部实时显示容器CPU和内存使用率，“运行监控”Tab 展示容器CPU、内存、下载磁盘、API进程和FFmpeg进程信息，并提供5分钟、15分钟、1小时、6小时、24小时和3天趋势图。默认每5秒采样到现有SQLite，超过1小时的查询自动按30秒、2分钟或5分钟聚合，系统每小时清理3天以前的数据。Docker环境优先读取cgroup的CPU配额、内存使用量和内存上限；未限制内存时使用容器可见的系统内存。FFmpeg进程表显示PID、关联任务、阶段、进度、CPU、内存、处理速度、帧数和媒体时间。`SYSTEM_METRICS_INTERVAL` 可调整采样秒数，允许2—60秒。
 
 采集任务、采集资源、调度设置和下载任务共同持久化在 `downloads/tasks.sqlite3`。重启服务后全部数据和并发设置仍然存在；中断的采集执行会回到空闲状态，之后可手动再次执行。当前版本每次只采集传入链接对应的当前页，不自动翻页。采集完成的资源先保持待下载，用户通过单条、批量或“全部下载”加入下载任务队列。
 
@@ -59,7 +64,7 @@ TS 分片与 M3U8 保存在同一视频目录。单轨视频使用 `0000.ts`、`
 
 M3U8、视频分片、AES 密钥、封面、悬停预览、VTT 和进度缩略图统一经过全局共享的 `FileDownloader`；来源浏览器会话只作为传输层传入。该对象统一处理取消检查、大小限制、内容校验、最多 3 次重试、实时网速统计、SHA-256 和 `.part` 原子落盘。SQLite 的任务进度仍按每新增 10 个分片或最多 5 秒批量更新，避免高频写库。恢复时验证文件，完整分片跳过，仅下载缺失或损坏分片；任务最多重新解析来源 3 次，以刷新过期播放链接。刷新后若分片结构变化则报错并保留旧文件，避免拼接不同版本。
 
-资源下载完成后，任务表中的 `cover_url`、`preview_url`、`vtt_url`、`m3u8_url`、`preview_m3u8_url` 和 `preview5_m3u8_url` 会替换为公开静态地址；远程来源继续保存在 `metadata_json` 中供恢复下载使用。`PUBLIC_BASE_URL` 控制公开地址前缀，默认 `http://localhost:8000`。例如 `downloads/jable/abc/cover.jpg` 对应 `http://localhost:8000/jable/abc/cover.jpg`，`downloads/123/fc2-ppv-4975150/index.m3u8` 对应 `http://localhost:8000/123/fc2-ppv-4975150/index.m3u8`。第三方导入的视频下载完成后，会用本地 `index.m3u8` 补齐缺失的封面、悬浮预览和 VTT，并生成直接复用现有分片、最长 180 秒的 `preview.m3u8` 以及最长 300 秒的 `preview5.m3u8`；这些附加资源失败只写入警告，不改变视频的完成状态。管理页和第三方系统可以直接使用这些完整地址。
+资源下载完成后，任务表中的 `cover_url`、`preview_url`、`vtt_url`、`m3u8_url`、`preview_m3u8_url` 和 `preview5_m3u8_url` 会替换为公开静态地址；远程来源继续保存在 `metadata_json` 中供恢复下载使用。`PUBLIC_BASE_URL` 控制公开地址前缀，未设置时默认 `http://localhost:8000`。管理后台顶部“系统配置”中的公开访问地址可以动态覆盖环境变量，保存后立即生效并持久化到现有 SQLite；优先级为后台配置、环境变量、系统默认。接口响应、上传文件、JSON 导出和节点同步会根据本地相对文件字段使用当前地址，不移动文件，也不批量迁移旧记录。例如 `downloads/jable/abc/cover.jpg` 对应 `http://localhost:8000/jable/abc/cover.jpg`，`downloads/123/fc2-ppv-4975150/index.m3u8` 对应 `http://localhost:8000/123/fc2-ppv-4975150/index.m3u8`。Jable、123AV 和第三方导入的视频下载完成后，每个章节都会生成直接复用该章现有分片、最长 180 秒的 `preview.m3u8` 以及最长 300 秒的 `preview5.m3u8`；第三方导入资源还会用第一章本地 `index.m3u8` 补齐缺失的封面、悬浮预览和 VTT。这些附加资源失败只写入对应章节警告，不改变视频的完成状态。管理页和第三方系统可以直接使用这些完整地址。
 视频元数据直接保存在 `tasks` 表，不再生成 `metadata.json`。视频目录保存列表封面 `cover.*`、列表悬停预览 `preview_image.*`、播放器封面 `poster.*`、VTT 及其引用的全部进度拼图；本地 VTT 改为相对路径。进度拼图直接放在视频目录根部，第一张为 `preview.jpg`，多张时依次为 `preview-002.jpg`、`preview-003.jpg`（若来源实际不是 JPEG，则保留检测到的真实图片后缀），不创建 `thumbnails/` 子目录。下载任务只有详情链接时，会通过站内精确搜索补取该视频的列表卡片资源；找不到的资源与下载失败会记录在 `warnings`。资源根据文件签名使用真实后缀：123AV 的 `preview.png` 实际可能是 MP4 悬停视频，此时保存为 `preview_image.mp4`。图片、MP4、WebM 以外的伪装内容不会作为预览保存。附加资源失败不影响视频完成。下载依赖来源允许浏览器会话读取媒体，来源拒绝或跨域限制时任务会明确失败并保留进度。
 
 Docker 已将 `./downloads` 挂载到 `/downloads`。服务公开映射 `downloads/jable/`、`downloads/123/`，以及上传目录 `downloads/uploads/video/`、`image/`、`other/`；公开地址分别使用 `/jable/`、`/123/`、`/uploads/video/`、`/uploads/image/`、`/uploads/other/`。上传临时分片 `downloads/uploads/chunks/` 不公开。静态资源响应允许跨域 GET、HEAD 和 Range 请求，便于第三方播放器直接使用。本地运行可通过 `DOWNLOAD_DIR` 设置下载目录，通过 `PUBLIC_BASE_URL` 设置导出链接的公开域名。数据库与文件必须一起保留，重建容器后才能继续恢复。
@@ -106,11 +111,12 @@ docker compose up -d --build api
 | `GET /api/downloads` | `status`、`search`、`limit`、`offset` | 下载任务列表 |
 | `POST /api/downloads/deduplicate` | 无 | 按视频 code 清理历史重复下载任务 |
 | `GET /api/download/{task_id}/files/{path}` | 下载任务 ID、相对文件路径 | 播放本地 m3u8、TS、封面与 VTT，支持 Range |
-| `GET/POST /api/collections` | POST：名称、列表链接 | 查询或创建采集任务 |
-| `POST /api/collections/bulk-create` | `name`、`url_template`、`start_page`、`end_page`、`scheduled_enabled` | 用 `${page}` 模板批量新建最多 500 个任务，按标题或 URL 跳过重复项 |
+| `GET/POST /api/collections` | GET：`page`、`page_size`、`keyword`、`source`、`status`、`scheduled_enabled`；POST：名称、列表链接、可选 `r2_sync_enabled`、可选 `node_ids` | 分页查询或创建采集任务；`node_ids` 支持最多 20 个下载节点 |
+| `POST /api/collections/bulk-create` | `name`、`url_template`、`start_page`、`end_page`、`scheduled_enabled`、可选 `r2_sync_enabled`、可选 `node_ids` | 用 `${page}` 模板批量新建最多 500 个任务，所有任务继承同一组下载节点，按标题或 URL 跳过重复项 |
 | `PUT/DELETE /api/collections/{id}` | 采集任务 ID | 修改或删除空闲采集任务 |
 | `POST /api/collections/{id}/execute` | 采集任务 ID | 异步触发一次列表采集 |
 | `POST /api/collections/bulk-execute` | `ids`：最多 100 个采集任务 ID | 批量触发列表采集 |
+| `POST /api/collections/bulk-delete` | `ids`：最多 100 个采集任务 ID | 批量删除空闲采集任务并保留已采集资源 |
 | `GET /api/collection-items` | `page`、`page_size`、`title`、`source`、`status` | 分页查询统一资源列表，返回采集信息和关联下载详情，并包含未关联的直接下载任务 |
 | `POST /api/collection-items/import` | 1–1000 条资源 JSON 数组 | 本地播放文件直接关联为已完成，远程资源自动加入下载队列 |
 | `POST /api/collection-items/import/validate` | 1–1000 条资源 JSON 数组 | 使用正式导入规则预览校验、去重及本地资源判断，不写入数据 |
@@ -123,29 +129,44 @@ docker compose up -d --build api
 | `POST /api/collection-items/bulk-download` | `ids`：最多 100 个采集资源 ID | 批量加入下载调度 |
 | `POST /api/collection-items/bulk-delete` | `ids`：最多 100 个资源 ID | 批量停止任务并删除本地文件和数据库记录 |
 | `POST /api/collection-items/download-all` | 无 | 将所有待下载采集资源批量加入下载任务队列 |
-| `GET/PUT /api/settings/scheduler` | `enabled`、`concurrency` | 查询或更新全局调度开关与并发数 |
+| `GET/PUT /api/settings/scheduler` | `enabled`、`concurrency`、`segment_concurrency` | 查询或更新全局调度开关、下载任务并发和单任务TS分片并发（默认3） |
+| `GET/PUT /api/settings/public-url` | `url` | 查询或动态保存公开访问根地址，保存后立即生效 |
+| `GET /api/resource-sync/records` | `page`、`page_size`、`keyword`、`status`、`site_id` | 分页搜索下载节点发送明细 |
+| `POST /api/resource-sync/records/retry` | `ids` 或 `all=true` | 多选重试或重试全部失败发送记录 |
+| `POST /api/resource-sync/records/delete` | `ids` | 删除发送历史，不删除本地或节点资源 |
 | `POST /upload/file` | `multipart/form-data` 的 `file` | 直接上传完整文件；按 96 位内容哈希去重并返回 `deduplicated` |
 | `GET /upload/chunk` | `identifier` | 查询已上传分片和合并状态 |
-| `POST /upload/chunk` | `identifier`、`chunkNumber`、可选 `totalChunks`、`file` | 幂等上传一个分片，编号从 1 开始 |
-| `POST /upload/merge` | `identifier`、`fileName`、`totalChunks` | 校验分片后提交后台合并；视频立即返回可预测的 M3U8 地址 |
+| `POST /upload/chunk` | `identifier`、`chunkNumber`、`totalChunks`、`file`，可选 `r2SyncEnabled` | 幂等上传一个分片，编号从 1 开始；无需携带原始文件名 |
+| `POST /upload/merge` | `identifier`、`fileName`，可选 `r2SyncEnabled` | 从上传记录读取分片总数，根据文件名识别类型，校验分片后提交后台合并；视频立即返回可预测的 M3U8 地址 |
 | `GET /upload/list` | `page`、`page_size`、`keyword`、`file_type`、`status` | 分页查询上传文件记录 |
 | `POST /upload/deleteByPath` | 文件 URL 数组 | 删除上传文件或指定上传会话 |
 | `POST /upload/bulk-delete` | `identifiers`：最多 100 个上传 ID | 批量删除上传文件、分片和记录 |
 | `DELETE /upload/{identifier}` | 路径中的上传 ID | 删除该 ID 的分类目录、临时分片和上传状态 |
 | `GET /uploads/{type}/{前2位}/{第3-4位}/...` | 公开静态地址 | 通过两层分片目录直接访问已完成的上传文件 |
+| `GET/PUT /api/r2/settings` | R2 Endpoint、Access Key、Bucket、公开地址、前缀、任务并发、文件并发和两个自动同步开关 | 查询或保存CF R2配置；单资源文件并发默认3 |
+| `POST /api/r2/settings/test` | 同上 | 使用当前表单参数测试R2连接 |
+| `GET /api/r2/tasks` | `page`、`page_size`、`keyword`、`status`、`resource_type` | 分页查询R2资源同步日志；来源可选 `collection`、`upload` |
+| `POST /api/r2/tasks/retry` | `ids`：最多100个日志ID | 重新调度失败的R2同步任务 |
+| `POST /api/r2/tasks/delete` | `ids`：最多100个日志ID | 删除非运行中的同步日志，保留R2对象和本地资源 |
+| `POST /api/r2/resources/sync` | `ids`：最多100个已完成下载任务ID | 将已完成的采集/下载资源加入R2同步队列 |
+| `POST /api/r2/uploads/sync` | `ids`：最多100个上传资源ID | 将已完成的上传资源加入R2同步队列 |
 
 ### 分片文件上传
 
 上传视频、图片和其他文件分别保存在 `downloads/uploads/video/`、`downloads/uploads/image/`、`downloads/uploads/other/`，临时分片保存在
 `downloads/uploads/chunks/<前2位>/<第3-4位>/<identifier>/`。上传记录和处理状态保存在现有 `tasks.sqlite3` 的单表 `uploads` 中，不使用关联查询；表按更新时间以及“类型、状态、更新时间”建立索引。旧 `upload.json` 和旧目录数据不导入。容器内对应 `/downloads/uploads/`。服务重启后可通过
-`GET /upload/chunk?identifier=...` 查询已有分片、后台合并状态并继续上传。重复上传同一分片会原子覆盖。`POST /upload/merge` 只校验分片数量并提交后台任务，不等待文件处理完成；视频响应会立即包含可预测的 HLS、封面、悬浮预览和 VTT 地址。客户端通过 `GET /upload/chunk` 轮询 `status`、`processingStage` 和 `completed`；处理阶段依次为 `merging`、`segmenting`、`generating_cover`、`generating_preview`、`generating_vtt`、`completed`，失败时为 `failed`。后台任务流式写入临时文件并原子发布；合并成功后删除分片，仅保留 SQLite 状态记录用于幂等查询和重复合并。服务重启后会自动继续未完成的处理任务。
+`GET /upload/chunk?identifier=...` 查询已有分片、后台合并状态并继续上传。重复上传同一分片会原子覆盖。上传分片时只记录 `totalChunks`，不依赖 multipart 中的原始文件名；`POST /upload/merge` 提交 `identifier` 和 `fileName`，由文件名决定资源类型与扩展名。合并接口校验分片数量并提交后台任务，不等待文件处理完成；视频响应会立即包含可预测的 HLS、封面、悬浮预览和 VTT 地址。客户端通过 `GET /upload/chunk` 轮询 `status`、`processingStage` 和 `completed`；处理阶段依次为 `merging`、`probing`、按需进入 `compressing`（否则为 `segmenting`）、`generating_cover`、`generating_preview`、`generating_vtt`、`completed`，失败时为 `failed`。后台任务流式写入临时文件并原子发布；合并成功后删除分片，仅保留 SQLite 状态记录用于幂等查询和重复合并。服务重启后会自动继续未完成的处理任务。
 
-分片编号从 1 开始。`identifier` 只允许字母、数字、下划线和连字符；管理页面的分片上传根据文件名、大小和修改时间生成稳定的 16 位十六进制 ID，同一文件重新选择后可继续断点上传。`POST /upload/file` 则在服务端写入文件的同一过程中计算 96 位 BLAKE2b，并编码成 16 位 URL 安全 ID；相同内容直接复用已有资源，不增加完整哈希字段或额外索引。服务端不要求浏览器计算完整文件哈希。脚本、源码、网页、可执行文件及相关配置文件会按文件名后缀拒绝，最终合并后还会检查常见的可执行文件和脚本内容特征；双重后缀也不能绕过。所有上传接口沿用 `JABLE_API_KEY` 鉴权。默认单分片最大 50 MiB、最终文件最大 20 GiB、最多 100000 个分片，可分别通过 `UPLOAD_CHUNK_MAX_BYTES`、`UPLOAD_FILE_MAX_BYTES`、`UPLOAD_MAX_CHUNKS` 调整。接口响应使用 `fileType` 返回 `video`、`image` 或 `other`。所有上传资源按 ID 前四位做两层分片：视频在 `uploads/video/<前2位>/<第3-4位>/<identifier>/` 中生成 `index.m3u8`、四位数字 TS、`cover.jpg`、`poster.jpg`、`preview_image.mp4`、`preview.vtt` 和 `preview*.jpg`；图片和其他单文件分别保存为 `uploads/image/<前2位>/<第3-4位>/<identifier>.<扩展名>` 和 `uploads/other/<前2位>/<第3-4位>/<identifier>.<扩展名>`。悬浮预览默认从视频的 10%、30%、50%、70%、90% 各截取 1.5 秒并拼接为无声 320×180 MP4，短视频自动减少片段。进度预览默认每 10 秒取一帧，200×112 缩略图以 10×10 拼成雪碧图，可通过 `UPLOAD_PREVIEW_INTERVAL` 调整间隔。封面或预览生成失败只写入 `warnings`，不影响 HLS 完成。`UPLOAD_HLS_TIME` 控制分片秒数，默认 3，`UPLOAD_VIDEO_TIMEOUT` 控制单次 FFmpeg 最长处理时间，默认 3600 秒，`UPLOAD_MERGE_WORKERS` 控制后台处理并发数，默认 1。旧的未分片上传目录不迁移、不读取，也不会出现在新接口返回中。
+分片编号从 1 开始。`identifier` 只允许字母、数字、下划线和连字符；管理页面在 HTTPS 或 localhost 环境下读取文件大小及首尾各 16 KiB，使用浏览器原生 SHA-256 生成 16 位十六进制 ID，小于等于 32 KiB 的文件读取全部内容。普通 HTTP 环境无法使用 `crypto.subtle` 时，自动根据文件名、大小和修改时间使用 FNV-1a 64 位算法生成同长度 ID。两种方式都不会读取整个大文件，同一文件重新选择后可继续断点上传。管理后台“分片上传文档”Tab 提供携带 `X-API-Key` 的完整 Vue 3 直连客户端和浏览器原生 JavaScript 直连示例，也提供由服务器保存密钥的 Java Spring Boot、PHP cURL 转发示例。`POST /upload/file` 则在服务端写入文件的同一过程中计算 96 位 BLAKE2b，并编码成 16 位 URL 安全 ID；相同内容直接复用已有资源，不增加完整哈希字段或额外索引。服务端不要求浏览器计算完整文件哈希。脚本、源码、网页、可执行文件及相关配置文件会按文件名后缀拒绝，最终合并后还会检查常见的可执行文件和脚本内容特征；双重后缀也不能绕过。所有上传接口沿用 `JABLE_API_KEY` 鉴权。默认单分片最大 50 MiB、最终文件最大 20 GiB、最多 100000 个分片，可分别通过 `UPLOAD_CHUNK_MAX_BYTES`、`UPLOAD_FILE_MAX_BYTES`、`UPLOAD_MAX_CHUNKS` 调整。接口响应使用 `fileType` 返回 `video`、`image` 或 `other`。所有上传资源按 ID 前四位做两层分片：视频在 `uploads/video/<前2位>/<第3-4位>/<identifier>/` 中生成 `index.m3u8`、四位数字 TS、`cover.jpg`、`poster.jpg`、`preview_image.mp4`、`preview.vtt`、`preview*.jpg`、`preview.m3u8` 和 `preview5.m3u8`；图片和其他单文件分别保存为 `uploads/image/<前2位>/<第3-4位>/<identifier>.<扩展名>` 和 `uploads/other/<前2位>/<第3-4位>/<identifier>.<扩展名>`。悬浮预览默认从视频的 10%、30%、50%、70%、90% 各截取约 3 秒并拼接为无声 320×180 MP4，短视频自动减少片段或缩短单段时长。进度预览默认每 10 秒取一帧，200×112 缩略图以 10×10 拼成雪碧图，可通过 `UPLOAD_PREVIEW_INTERVAL` 调整间隔。上传视频还会复用本地 TS 分片生成最长 3 分钟和 5 分钟的短时 HLS 清单。封面或预览生成失败只写入 `warnings`，不影响 HLS 完成。`UPLOAD_HLS_TIME` 控制分片秒数，默认 3，`UPLOAD_VIDEO_TIMEOUT` 控制单次 FFmpeg 最长处理时间，默认 3600 秒，`UPLOAD_MERGE_WORKERS` 控制后台处理并发数，默认 1。旧的未分片上传目录不迁移、不读取，也不会出现在新接口返回中。
+
+上传视频会先用 FFprobe 读取时长、分辨率、编码和码率。默认仅在视频或音频编码不兼容 HLS、分辨率超过 1920×1080，或者文件大于 500 MiB/时长超过 30 分钟且视频码率高于 5 Mbps 时转码；低码率长视频直接切片，避免重复压缩。转码使用 H.264、AAC 128k、CRF 25 和 `veryfast`，不放大小分辨率视频。顶部“系统配置”的 FFmpeg 页面可动态设置并发、启用状态、大小/时长阈值、最大码率、分辨率、CRF、preset、音频码率和HLS分片时长。配置保存在SQLite；保存后影响等待中和之后新增的任务，运行中的任务使用启动时取得的配置快照。首次启动默认值可通过 `UPLOAD_COMPRESS_ENABLED`、`UPLOAD_COMPRESS_MIN_BYTES`、`UPLOAD_COMPRESS_MIN_DURATION`、`UPLOAD_COMPRESS_MAX_WIDTH`、`UPLOAD_COMPRESS_MAX_HEIGHT`、`UPLOAD_COMPRESS_MAX_VIDEO_BITRATE`、`UPLOAD_COMPRESS_CRF`、`UPLOAD_COMPRESS_PRESET`、`UPLOAD_AUDIO_BITRATE` 和 `UPLOAD_HLS_TIME` 覆盖。完成响应和上传列表会返回 `duration`、`durationText`、`width`、`height`、`videoCodec`、`audioCodec`、`bitRate`、`originalSize`、`processedSize`、`compressed` 与 `compressionRatio`；`compressionRatio` 表示最终 TS 总大小相对原文件减少的百分比。
+
+视频文件合并后会写入持久化 FFmpeg 队列，`POST /upload/merge` 和 `POST /upload/file` 不等待视频转码完成。`UPLOAD_FFMPEG_CONCURRENCY` 只用于数据库尚无设置时的初始并发数，默认 1；之后以管理页面保存的数据库设置为准。`UPLOAD_FFMPEG_MAX_CONCURRENCY` 控制可设置的上限，默认 16。并发数为 0 时暂停调度；降低并发不会杀死正在运行的 FFmpeg。处理失败保留合并后的原视频供重试，全部资源成功发布后才删除原视频。
 
 ```bash
 curl -F "identifier=demo001" -F "chunkNumber=1" -F "totalChunks=2" -F "file=@part1.mp4" http://localhost:8000/upload/chunk
 curl -F "identifier=demo001" -F "chunkNumber=2" -F "totalChunks=2" -F "file=@part2.mp4" http://localhost:8000/upload/chunk
-curl -H "Content-Type: application/json" -d '{"identifier":"demo001","fileName":"demo.mp4","totalChunks":2}' http://localhost:8000/upload/merge
+curl -H "Content-Type: application/json" -d '{"identifier":"demo001","fileName":"demo.mp4"}' http://localhost:8000/upload/merge
 ```
 
 ```bash
@@ -167,7 +188,7 @@ curl --get "http://localhost:8000/api/detail" --data-urlencode "url=https://jabl
 }
 ```
 
-详情的 `data` 包含同样的视频字段，另有 `published_at`、`actors`、`tags`、`m3u8_url`。
+详情的 `data` 包含同样的视频字段，另有 `published_at`、`actors`、`tags`、`m3u8_url` 和 `chapters`。多章节资源的 `m3u8_url`、`vtt_url` 保持指向第一章节，`chapters` 返回每章的序号、名称、时长、播放地址和 VTT 地址。
 `published_at` 优先返回页面“上市於”的日期（如 `2026-09-05`）；缺失时使用页面结构化日期信息。
 缺失的普通字段为 `null`，演员和标签缺失时为 `[]`。时间与时长保留来源格式（如 ISO 8601 或 `12:34`）。
 播放地址保留完整查询参数，可能过期；过期后重新调用详情接口。API 不代理视频流。
@@ -189,7 +210,7 @@ curl --get "http://localhost:8000/api/detail" --data-urlencode "url=https://jabl
 | 504 | 50401 | 抓取超时 |
 | 500 | 50000 | 内部错误 |
 
-API 优先使用 HTTP 获取页面；收到 Cloudflare challenge 时回退到项目已有的 Chromium 浏览器。每个进程同时只运行一个抓取浏览器，用完立即关闭。Docker 镜像已包含浏览器；本地运行需安装 Chrome/Chromium 及匹配的 ChromeDriver。浏览器仍无法加载数据时返回明确错误，不将验证页当作空列表成功返回。HTTP 重定向逐跳校验，浏览器回退校验输入地址及最终页面地址。
+API 优先使用 HTTP 获取页面；收到 Cloudflare challenge 时回退到项目已有的 Chromium 浏览器。每个进程同时只操作一个抓取浏览器，但验证成功后会持续复用该浏览器、Cookie和User-Agent，批量采集多页时不再为每页反复启动Chromium；浏览器进程失效或页面等待超时会自动销毁，下次请求重新创建，服务停止时统一释放。Docker 镜像已包含浏览器；本地运行需安装 Chrome/Chromium 及匹配的 ChromeDriver。浏览器仍无法加载数据时返回明确错误，不将验证页当作空列表成功返回。HTTP 重定向逐跳校验，浏览器回退校验输入地址及最终页面地址。
 
 运行离线接口测试（覆盖分页、解析、鉴权、URL 校验、重定向及异常）：
 

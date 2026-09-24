@@ -55,6 +55,7 @@ def parse_detail(source, url):
             poster_url = absolute(url, parse_qs(urlsplit(urls[0]).query).get('poster', [None])[0])
     preview = player.select_one('[data-preview]') if player else None
     scope = info or BeautifulSoup('', 'html.parser')
+    chapters = player_chapters(source)
     return dict(source='123av', id=urlsplit(url).path.rstrip('/').split('/')[-1], url=url,
                 title=text(soup.select_one('h1.watch__title')),
                 cover=poster_url, poster=poster_url,
@@ -62,10 +63,12 @@ def parse_detail(source, url):
                 duration=text(scope.select_one('.duration')), published_at=published,
                 actors=list(dict.fromkeys(filter(None, [text(a) for a in scope.select('a[href*="/actresses/"]')]))),
                 tags=list(dict.fromkeys(filter(None, [text(a) for a in scope.select('a[href*="/genres/"]')]))),
-                m3u8_url=extract_m3u8(str(player)) if player else None)
+                m3u8_url=extract_m3u8(str(player)) if player else None,
+                chapters=chapters)
 
 
-def player_urls(source):
+def player_chapters(source):
+    """Return every episode while keeping source-specific player URLs internal."""
     soup = BeautifulSoup(source, 'html.parser')
     node = soup.select_one('.watch__main[x-data]')
     match = re.search(r"\bplayer\(JSON\.parse\('((?:\\.|[^'\\])*)'\)", node.get('x-data', '')) if node else None
@@ -78,4 +81,17 @@ def player_urls(source):
         return []
     if not isinstance(episodes, list):
         return []
-    return [item['url'] for item in episodes if isinstance(item, dict) and isinstance(item.get('url'), str)]
+    result = []
+    for index, item in enumerate(episodes, 1):
+        if not isinstance(item, dict) or not isinstance(item.get('url'), str):
+            continue
+        label = next((item.get(key) for key in ('title', 'name', 'label')
+                      if isinstance(item.get(key), str) and item.get(key).strip()), None)
+        result.append(dict(index=index, title=label.strip() if label else f'第 {index} 章',
+                           duration=item.get('duration') if isinstance(item.get('duration'), str) else None,
+                           player_url=item['url']))
+    return result
+
+
+def player_urls(source):
+    return [item['player_url'] for item in player_chapters(source)]

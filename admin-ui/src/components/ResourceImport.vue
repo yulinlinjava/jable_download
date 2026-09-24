@@ -57,12 +57,16 @@ function executeFormatter(code: string, raw: unknown): Promise<unknown> {
     const encoder = new TextEncoder();
     const bytes = (value) => typeof value === 'string' ? encoder.encode(value) : new Uint8Array(value);
     const hex = (value) => Array.from(new Uint8Array(value), b => b.toString(16).padStart(2, '0')).join('');
+    const subtle = () => {
+      if (!self.crypto || !self.crypto.subtle) throw new Error('SHA/HMAC 助手需要通过 HTTPS 打开管理后台');
+      return self.crypto.subtle;
+    };
     const helpers = {
       now: () => Math.floor(Date.now() / 1000),
-      sha256: async (value) => hex(await crypto.subtle.digest('SHA-256', bytes(value))),
+      sha256: async (value) => hex(await subtle().digest('SHA-256', bytes(value))),
       hmacSha256: async (secret, value) => {
-        const key = await crypto.subtle.importKey('raw', bytes(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-        return hex(await crypto.subtle.sign('HMAC', key, bytes(value)));
+        const key = await subtle().importKey('raw', bytes(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+        return hex(await subtle().sign('HMAC', key, bytes(value)));
       },
       base64Url: (value) => {
         let binary = ''; for (const item of bytes(value)) binary += String.fromCharCode(item);
@@ -115,7 +119,9 @@ async function submit() {
       : ensureItems(parseInput())
     result.value = (await api.post('/collection-items/import', items)).data.data
     emit('imported')
-    if (result.value?.created) ElMessage.success(`已导入 ${result.value.created} 条资源`)
+    if (result.value?.created || result.value?.updated) {
+      ElMessage.success(`导入完成：新增 ${result.value.created || 0} 条，覆盖 ${result.value.updated || 0} 条`)
+    }
   } catch (e: any) { error.value = e.message }
   finally { busy.value = false }
 }
@@ -152,7 +158,7 @@ watch([input, mode, scriptId], invalidatePreview)
       <div class="import-preview-heading"><strong>处理结果预览</strong><span>{{ previewItems.length }} 条资源</span></div>
       <el-input :model-value="previewText" type="textarea" :rows="10" readonly spellcheck="false"/>
       <el-alert v-if="validation" :type="validation.failed ? 'warning' : 'success'" :closable="false"
-        :title="`校验 ${validation.total} 条：有效 ${validation.valid} 条，本地关联 ${validation.local_linked} 条，远程排队 ${validation.queued} 条，跳过 ${validation.skipped} 条，失败 ${validation.failed} 条`"/>
+        :title="`校验 ${validation.total} 条：有效 ${validation.valid} 条，覆盖 ${validation.updated || 0} 条，本地关联 ${validation.local_linked} 条，远程排队 ${validation.queued} 条，跳过 ${validation.skipped} 条，失败 ${validation.failed} 条`"/>
       <el-table v-if="validation && (validation.failed || validation.skipped)"
         :data="validation.results.filter(item => item.status !== 'valid')" max-height="180">
         <el-table-column prop="index" label="数组第几条" width="110"/>
@@ -163,8 +169,8 @@ watch([input, mode, scriptId], invalidatePreview)
 
     <template v-if="result">
       <el-alert :type="result.failed ? 'warning' : 'success'" :closable="false"
-        :title="`共 ${result.total} 条：成功 ${result.created} 条，本地关联 ${result.local_linked} 条，加入下载队列 ${result.queued} 条，跳过 ${result.skipped} 条，失败 ${result.failed} 条`"/>
-      <el-table :data="result.results.filter(item => item.status !== 'created')" max-height="180" empty-text="全部导入成功">
+        :title="`共 ${result.total} 条：新增 ${result.created} 条，覆盖 ${result.updated || 0} 条，本地关联 ${result.local_linked} 条，加入下载队列 ${result.queued} 条，跳过 ${result.skipped} 条，失败 ${result.failed} 条`"/>
+      <el-table :data="result.results.filter(item => !['created','updated'].includes(item.status))" max-height="180" empty-text="全部导入成功">
         <el-table-column prop="index" label="数组第几条" width="110"/>
         <el-table-column label="结果" width="80"><template #default="{ row }">{{ row.status === 'failed' ? '失败' : '跳过' }}</template></el-table-column>
         <el-table-column prop="message" label="原因"/>
