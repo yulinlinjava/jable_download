@@ -33,6 +33,18 @@ class DownloadError(Exception):
     pass
 
 
+class ExpiredSource(DownloadError):
+    """The current source address must be refreshed before another request."""
+
+
+class PlanChanged(DownloadError):
+    """Preserve completed pieces instead of retrying an incompatible stream."""
+
+
+class PreparationDeferred(DownloadError):
+    """Release the download slot while a collector is offline or unavailable."""
+
+
 class Stopped(Exception):
     pass
 
@@ -53,6 +65,144 @@ def atomic_write(path, data):
         file.flush()
         os.fsync(file.fileno())
     os.replace(temporary, path)
+
+
+DATABASE_KEY_SUFFIXES = ('.sign.key', '.r2.key', '.sync.key', '.collector.key')
+
+
+def same_database_path(left, right):
+    """Compare database paths without requiring either file to exist."""
+    if os.path.normcase(os.path.abspath(os.fspath(left))) == os.path.normcase(
+            os.path.abspath(os.fspath(right))):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except (FileNotFoundError, OSError):
+        return False
+
+
+def required_database_keys(db):
+    checks = {
+        '.sign.key': "SELECT 1 FROM download_signers WHERE config IS NOT NULL AND config<>'' LIMIT 1",
+        '.r2.key': "SELECT 1 FROM r2_settings WHERE secret_access_key IS NOT NULL AND secret_access_key<>'' LIMIT 1",
+        '.collector.key': "SELECT 1 FROM local_collector_configs WHERE api_key IS NOT NULL AND api_key<>'' LIMIT 1",
+    }
+    required = set()
+    for suffix, query in checks.items():
+        try:
+            if db.execute(query).fetchone():
+                required.add(suffix)
+        except sqlite3.OperationalError as exc:
+            if 'no such table' not in str(exc).lower() and 'no such column' not in str(exc).lower():
+                raise
+    # request_headers was added after the original sync-key check.  Inspect the
+    # schema separately so backups of older databases remain compatible.
+    try:
+        sync_columns = {row[1] for row in db.execute(
+            'PRAGMA table_info(resource_sync_sites)').fetchall()}
+        if ('request_headers' in sync_columns and db.execute(
+                "SELECT 1 FROM resource_sync_sites WHERE request_headers IS NOT NULL "
+                "AND request_headers<>'' LIMIT 1").fetchone()):
+            required.add('.sync.key')
+    except sqlite3.OperationalError as exc:
+        if 'no such table' not in str(exc).lower():
+            raise
+    return required
+
+
+def prepare_database_replacement(destination):
+    """Refuse to replace a backup database that is currently in use."""
+    if not destination.exists():
+        return
+    db = sqlite3.connect(destination, timeout=0.1, isolation_level=None)
+    try:
+        db.execute('PRAGMA busy_timeout=100')
+        db.execute('PRAGMA locking_mode=EXCLUSIVE')
+        db.execute('BEGIN EXCLUSIVE')
+        db.execute('COMMIT')
+        checkpoint = db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()
+        if checkpoint and checkpoint[0]:
+            raise DownloadError('旧备份数据库正在使用，暂时不能覆盖')
+        mode = db.execute('PRAGMA journal_mode=DELETE').fetchone()
+        if not mode or str(mode[0]).lower() != 'delete':
+            raise DownloadError('旧备份数据库正在使用，暂时不能覆盖')
+    except sqlite3.OperationalError as exc:
+        if 'locked' in str(exc).lower() or 'busy' in str(exc).lower():
+            raise DownloadError('旧备份数据库正在使用，暂时不能覆盖') from None
+        raise
+    finally:
+        db.close()
+
+
+def backup_database_bundle(source, destination):
+    """Create a standalone SQLite snapshot and copy its companion encryption keys."""
+    source, destination = Path(source), Path(destination)
+    if same_database_path(source, destination):
+        raise DownloadError('备份文件不能与当前运行数据库相同')
+    if not source.is_file():
+        raise DownloadError('当前运行数据库不存在')
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    temporary = destination.with_name(f'.{destination.name}.{token}.tmp')
+    staged_keys = {}
+    temporary_sidecars = (Path(str(temporary) + '-wal'), Path(str(temporary) + '-shm'))
+    try:
+        source_db = sqlite3.connect(source, timeout=30)
+        target_db = sqlite3.connect(temporary, timeout=30)
+        try:
+            source_db.execute('PRAGMA query_only=ON')
+            required_keys = required_database_keys(source_db)
+            source_db.backup(target_db, pages=2048, sleep=0.01)
+            target_db.execute('PRAGMA journal_mode=DELETE').fetchone()
+            check = target_db.execute('PRAGMA integrity_check').fetchone()
+            if not check or check[0] != 'ok':
+                raise DownloadError('数据库备份完整性检查失败')
+        finally:
+            target_db.close()
+            source_db.close()
+        with temporary.open('rb+') as file:
+            os.fsync(file.fileno())
+
+        for suffix in DATABASE_KEY_SUFFIXES:
+            source_key = source.with_suffix(suffix)
+            destination_key = destination.with_suffix(suffix)
+            if not source_key.is_file():
+                if suffix in required_keys:
+                    raise DownloadError(f'数据库需要密钥文件 {source_key.name}，无法完成备份')
+                continue
+            staged = destination_key.with_name(f'.{destination_key.name}.{token}.tmp')
+            with source_key.open('rb') as input_file, staged.open('wb') as output_file:
+                shutil.copyfileobj(input_file, output_file)
+                output_file.flush()
+                os.fsync(output_file.fileno())
+            staged_keys[suffix] = staged
+
+        prepare_database_replacement(destination)
+        copied_keys = []
+        for suffix, staged in staged_keys.items():
+            destination_key = destination.with_suffix(suffix)
+            os.replace(staged, destination_key)
+            copied_keys.append(destination_key.name)
+        # Publish the database last. During first migration its existence is the
+        # completion marker, so an interrupted copy is retried on the next start.
+        os.replace(temporary, destination)
+        for sidecar in (Path(str(destination) + '-wal'), Path(str(destination) + '-shm')):
+            sidecar.unlink(missing_ok=True)
+        stat = destination.stat()
+        return {
+            'backupPath': str(destination),
+            'backupSize': stat.st_size,
+            'lastBackupAt': stat.st_mtime,
+            'copiedKeys': copied_keys,
+            'integrity': 'ok',
+        }
+    finally:
+        temporary.unlink(missing_ok=True)
+        for sidecar in temporary_sidecars:
+            sidecar.unlink(missing_ok=True)
+        for staged in staged_keys.values():
+            if staged is not None:
+                staged.unlink(missing_ok=True)
 
 
 class SpeedMeter:
@@ -111,7 +261,7 @@ class FileDownloader:
                 if validator:
                     validator(data)
                 return data
-            except (Stopped, Cancelled):
+            except (Stopped, Cancelled, ExpiredSource, PlanChanged):
                 raise
             except Exception as exc:
                 last_error = exc
@@ -247,6 +397,8 @@ class HttpTransport:
                     url = urljoin(url, location)
                     continue
                 if not 200 <= response.status_code < 300:
+                    if response.status_code in (401, 403, 410):
+                        raise ExpiredSource(f'播放资源访问失败：HTTP {response.status_code}，需要更新地址')
                     raise DownloadError(f'资源获取失败：HTTP {response.status_code}')
                 if byte_range and response.status_code != 206:
                     raise DownloadError('资源不支持分片字节范围')
@@ -368,6 +520,8 @@ class BrowserTransport:
           })().catch(e=>done({error:String(e).slice(0,120)})).finally(()=>clearTimeout(timer));
         """, url, byte_range, limit, extra_headers or {})
         if not result or 'error' in result:
+            if re.search(r'HTTP (401|403|410)\b', str((result or {}).get('error', ''))):
+                raise ExpiredSource('浏览器播放资源访问失败，需要更新地址')
             if byte_range is None and not extra_headers:
                 return self.cdp_get(url,limit)
             raise DownloadError('资源获取失败：' + ((result or {}).get('error', '浏览器无响应')))
@@ -457,6 +611,9 @@ class SigningTransport:
         signers, task = self.signers, self.task
         return lambda: SigningTransport(base_factory(), signers, task)
 
+    def resolve_asset_url(self, reference, base_url, resource_type):
+        return self.signers.resolve_reference(self.task['source'], reference, base_url, resource_type)
+
 
 @contextmanager
 def browser_source(url):
@@ -516,7 +673,7 @@ def build_plan(file_downloader, task_id, transport, stream_url):
     def playlist(url):
         def validate(data):
             if not data.decode('utf-8-sig').lstrip().startswith('#EXTM3U'):
-                raise DownloadError('来源没有返回有效 m3u8')
+                raise ExpiredSource('来源没有返回有效 m3u8，需要更新播放地址')
         raw = file_downloader.fetch(task_id, transport, url, limit=4 * 1024 * 1024,
                                     validator=validate, resource_type='playlist').decode('utf-8-sig')
         return m3u8.loads(raw)
@@ -640,8 +797,15 @@ def validate_payload(data, resource, folder):
 class DownloadManager:
     MAX_CONCURRENCY = 10
     MAX_SEGMENT_CONCURRENCY = 16
+    SEGMENT_COMPACTION_KEY = 'completed_segment_compaction_v1'
+    TASK_RESPONSE_COLUMNS = '''id,source,video_id,url,status,r2_synced,r2_sync_status,
+        r2_synced_at,local_deleted,local_deleted_at,total_segments,downloaded_segments,
+        downloaded_bytes,title,poster_file,cover_url,preview_file,preview_url,vtt_file,
+        vtt_url,m3u8_url,preview_m3u8_file,preview_m3u8_url,preview5_m3u8_file,
+        preview5_m3u8_url,release_date,metadata_json,message,error,warnings,created,updated'''
 
-    def __init__(self, root, resolver=browser_source, start_enabled=True, database=None):
+    def __init__(self, root, resolver=browser_source, start_enabled=True,
+                 database=None, legacy_database=None):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         environment_url = os.getenv('PUBLIC_BASE_URL')
@@ -654,10 +818,13 @@ class DownloadManager:
         self.public_base_url_source = self.environment_public_base_url_source
         self.public_base_url_updated_at = None
         self.database = Path(database).resolve() if database else self.root / 'tasks.sqlite3'
+        self.database_backup_lock = threading.Lock()
         self.segment_concurrency = 3
         self.database.parent.mkdir(parents=True, exist_ok=True)
         self.resolver = resolver
         self.signers = None
+        self.collector_available = None
+        self.collector_resolver = None
         self.completion_callback = None
         self.stop_event, self.wake = threading.Event(), threading.Event()
         self.cancelled = set()
@@ -678,6 +845,16 @@ class DownloadManager:
         except OSError:
             self.lockfile.close()
             raise RuntimeError('下载目录已有服务运行，请使用单个 API worker')
+        legacy_database = Path(legacy_database) if legacy_database else None
+        if (legacy_database and not same_database_path(self.database, legacy_database)
+                and not self.database.exists() and legacy_database.is_file()):
+            try:
+                log.info('Migrating legacy database from %s to %s',
+                         legacy_database, self.database)
+                backup_database_bundle(legacy_database, self.database)
+            except Exception:
+                self.lockfile.close()
+                raise
         with self.db() as db:
             # Downloads continuously write segment progress. WAL lets API reads
             # proceed without waiting for those short write transactions.
@@ -692,6 +869,7 @@ class DownloadManager:
                   m3u8_url TEXT, preview_m3u8_url TEXT, preview_m3u8_file TEXT,
                   preview5_m3u8_url TEXT, preview5_m3u8_file TEXT,
                   metadata_json TEXT NOT NULL DEFAULT '{}',
+                  local_collect_enabled INTEGER NOT NULL DEFAULT 0,
                   status TEXT NOT NULL DEFAULT 'pending', message TEXT, error TEXT,
                   warnings TEXT NOT NULL DEFAULT '[]', plan TEXT,
                   r2_synced INTEGER NOT NULL DEFAULT 0,
@@ -714,6 +892,15 @@ class DownloadManager:
                   ON tasks(title_key) WHERE title_key IS NOT NULL AND title_key<>'';
                 CREATE INDEX IF NOT EXISTS tasks_status_created ON tasks(status,created);
                 CREATE INDEX IF NOT EXISTS tasks_collection ON tasks(collection_id,last_seen);
+                CREATE INDEX IF NOT EXISTS tasks_last_seen_id
+                  ON tasks(last_seen DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS tasks_status_last_seen_id
+                  ON tasks(status,last_seen DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS tasks_source_last_seen_id
+                  ON tasks(source,last_seen DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS tasks_collection_last_seen_id
+                  ON tasks(collection_id,last_seen DESC,id DESC);
+                CREATE INDEX IF NOT EXISTS tasks_url ON tasks(url);
                 CREATE TABLE IF NOT EXISTS app_settings (
                   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL);
             ''')
@@ -734,12 +921,20 @@ class DownloadManager:
                 db.execute('ALTER TABLE tasks ADD COLUMN local_deleted INTEGER NOT NULL DEFAULT 0')
             if 'local_deleted_at' not in columns:
                 db.execute('ALTER TABLE tasks ADD COLUMN local_deleted_at REAL')
+            if 'local_collect_enabled' not in columns:
+                db.execute('''ALTER TABLE tasks ADD COLUMN
+                              local_collect_enabled INTEGER NOT NULL DEFAULT 0''')
+            if 'download_retry_at' not in columns:
+                db.execute('ALTER TABLE tasks ADD COLUMN download_retry_at REAL NOT NULL DEFAULT 0')
+            db.execute('''CREATE INDEX IF NOT EXISTS tasks_download_retry
+                          ON tasks(status,download_retry_at,created)''')
             db.execute("""UPDATE tasks SET r2_sync_status=CASE
                           WHEN r2_synced=1 THEN 'synced' ELSE 'unsynced' END
                           WHERE r2_sync_status IS NULL OR r2_sync_status NOT IN
                           ('unsynced','syncing','synced')""")
             db.execute("UPDATE tasks SET r2_sync_status='synced' WHERE r2_synced=1")
-            db.execute("UPDATE tasks SET status='queued',updated=? WHERE status='downloading'", (time.time(),))
+            db.execute("""UPDATE tasks SET status='queued',download_retry_at=0,updated=?
+                          WHERE status IN ('downloading','waiting_collector')""", (time.time(),))
             db.execute('UPDATE tasks SET assets_refresh=1 WHERE assets_refresh=2')
             db.execute('UPDATE tasks SET assets_refresh=3 WHERE assets_refresh=4')
             queued_chapter_previews = self.queue_missing_chapter_previews(db)
@@ -768,6 +963,9 @@ class DownloadManager:
         self.preview_generator = MediaPreviewGenerator(preview_timeout, preview_interval)
         self.threads = [threading.Thread(target=self.run, args=(index,), name=f'download-worker-{index + 1}', daemon=True)
                         for index in range(self.MAX_CONCURRENCY)]
+        self.threads.append(threading.Thread(
+            target=self._compact_legacy_completed_segments,
+            name='completed-segment-compactor', daemon=True))
         for thread in self.threads:
             thread.start()
 
@@ -780,6 +978,51 @@ class DownloadManager:
                 yield db
         finally:
             db.close()
+
+    def database_settings(self, backup_path):
+        backup_path = Path(backup_path)
+        active_stat = self.database.stat() if self.database.exists() else None
+        backup_stat = backup_path.stat() if backup_path.exists() else None
+        return {
+            'activePath': str(self.database),
+            'activeSize': active_stat.st_size if active_stat else 0,
+            'backupPath': str(backup_path),
+            'backupExists': bool(backup_stat),
+            'backupSize': backup_stat.st_size if backup_stat else 0,
+            'lastBackupAt': backup_stat.st_mtime if backup_stat else None,
+            'separateStorage': not same_database_path(
+                self.database, self.root / 'tasks.sqlite3'),
+        }
+
+    def backup_database(self, backup_path):
+        if not self.database_backup_lock.acquire(blocking=False):
+            raise DownloadError('数据库备份正在进行，请稍后重试')
+        try:
+            try:
+                result = backup_database_bundle(self.database, backup_path)
+            except DownloadError:
+                raise
+            except (OSError, sqlite3.Error) as exc:
+                raise DownloadError(f'数据库备份失败：{exc}') from None
+            return self.database_settings(backup_path) | result
+        finally:
+            self.database_backup_lock.release()
+
+    def preview_generation_settings(self):
+        """Read the shared preview switches without coupling download startup to uploads."""
+        defaults = {'hover': True, 'vtt': True}
+        try:
+            with self.db() as db:
+                rows = db.execute(
+                    """SELECT key,value FROM ffmpeg_settings
+                       WHERE key IN ('preview.hover_enabled','preview.vtt_enabled')""").fetchall()
+        except sqlite3.Error:
+            return defaults
+        stored = {row['key']: str(row['value']).strip() for row in rows}
+        return {
+            'hover': stored.get('preview.hover_enabled', '1') == '1',
+            'vtt': stored.get('preview.vtt_enabled', '1') == '1',
+        }
 
     @staticmethod
     def queue_missing_chapter_previews(db):
@@ -820,8 +1063,12 @@ class DownloadManager:
 
     @staticmethod
     def rebuild_progress(db, task_id=None):
-        where = 'WHERE id=?' if task_id else ''
-        values = (task_id,) if task_id else ()
+        conditions = ["status<>'completed'"]
+        values = []
+        if task_id:
+            conditions.append('id=?')
+            values.append(task_id)
+        where = 'WHERE ' + ' AND '.join(conditions)
         db.execute(f'''UPDATE tasks SET
             total_segments=(SELECT count(*) FROM files f WHERE f.task_id=tasks.id AND f.kind='segment'),
             downloaded_segments=(SELECT count(*) FROM files f WHERE f.task_id=tasks.id
@@ -829,6 +1076,99 @@ class DownloadManager:
             downloaded_bytes=(SELECT coalesce(sum(f.size),0) FROM files f WHERE f.task_id=tasks.id
                               AND f.kind='segment' AND f.hash IS NOT NULL)
             {where}''', values)
+
+    def compact_completed_segments(self, db, task_id, metadata=None):
+        """Persist final progress and discard resumable TS rows for one completed task."""
+        row = db.execute(
+            'SELECT status,metadata_json FROM tasks WHERE id=?', (task_id,)).fetchone()
+        if not row or row['status'] != 'completed':
+            return 0
+        summary = db.execute('''SELECT count(*) total,
+            sum(CASE WHEN hash IS NOT NULL THEN 1 ELSE 0 END) done,
+            coalesce(sum(CASE WHEN hash IS NOT NULL THEN size ELSE 0 END),0) bytes
+            FROM files WHERE task_id=? AND kind='segment' ''', (task_id,)).fetchone()
+        total = int(summary['total'] or 0)
+        done = int(summary['done'] or 0)
+        downloaded_bytes = int(summary['bytes'] or 0)
+        if not total:
+            return 0
+        if done != total:
+            log.warning('Completed task %s still has incomplete segment rows; keeping them', task_id)
+            return 0
+        if metadata is None:
+            try:
+                metadata = json.loads(row['metadata_json'] or '{}')
+            except (TypeError, ValueError):
+                metadata = {}
+        chapters = metadata.get('chapters') if isinstance(metadata.get('chapters'), list) else []
+        for index, chapter in enumerate(chapters, 1):
+            if not isinstance(chapter, dict):
+                continue
+            pattern = f'{index:02d}/%' if len(chapters) > 1 else '%'
+            chapter_summary = db.execute('''SELECT count(*) total,
+                sum(CASE WHEN hash IS NOT NULL THEN 1 ELSE 0 END) done,
+                coalesce(sum(CASE WHEN hash IS NOT NULL THEN size ELSE 0 END),0) bytes
+                FROM files WHERE task_id=? AND kind='segment' AND path LIKE ?''',
+                (task_id, pattern)).fetchone()
+            chapter_total = int(chapter_summary['total'] or 0)
+            chapter_done = int(chapter_summary['done'] or 0)
+            chapter.update({
+                'total_segments': chapter_total,
+                'downloaded_segments': chapter_done,
+                'downloaded_bytes': int(chapter_summary['bytes'] or 0),
+                'download_progress': (100.0 if chapter_total and chapter_done == chapter_total
+                                      else round(chapter_done / chapter_total * 100, 2)
+                                      if chapter_total else 0.0),
+                'download_status': ('completed' if chapter_total and chapter_done == chapter_total
+                                    else 'downloading' if chapter_done else 'pending'),
+            })
+        db.execute('''UPDATE tasks SET total_segments=?,downloaded_segments=?,
+                      downloaded_bytes=?,metadata_json=? WHERE id=?''',
+                   (total, done, downloaded_bytes,
+                    json.dumps(metadata, ensure_ascii=False), task_id))
+        deleted = db.execute(
+            "DELETE FROM files WHERE task_id=? AND kind='segment'", (task_id,)).rowcount
+        return max(0, deleted)
+
+    def _compact_legacy_completed_segments(self):
+        """Backfill existing completed tasks without delaying API startup."""
+        try:
+            with self.db() as db:
+                if db.execute('SELECT 1 FROM app_settings WHERE key=?',
+                              (self.SEGMENT_COMPACTION_KEY,)).fetchone():
+                    return
+            compacted_tasks = compacted_segments = 0
+            while not self.stop_event.is_set():
+                with self.db() as db:
+                    rows = db.execute('''SELECT t.id FROM tasks t
+                        WHERE t.status='completed'
+                          AND EXISTS(SELECT 1 FROM files f WHERE f.task_id=t.id
+                                     AND f.kind='segment')
+                          AND NOT EXISTS(SELECT 1 FROM files f WHERE f.task_id=t.id
+                                         AND f.kind='segment' AND f.hash IS NULL)
+                        ORDER BY t.created LIMIT 100''').fetchall()
+                    for row in rows:
+                        deleted = self.compact_completed_segments(db, row['id'])
+                        if deleted:
+                            compacted_tasks += 1
+                            compacted_segments += deleted
+                if not rows:
+                    with self.db() as db:
+                        db.execute('''INSERT INTO app_settings(key,value,updated) VALUES(?,?,?)
+                                      ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                      updated=excluded.updated''',
+                                   (self.SEGMENT_COMPACTION_KEY,
+                                    json.dumps({'tasks': compacted_tasks,
+                                                'segments': compacted_segments}),
+                                    time.time()))
+                    if compacted_segments:
+                        log.info('Compacted %s completed tasks and removed %s TS records',
+                                 compacted_tasks, compacted_segments)
+                    return
+                if self.stop_event.wait(0.01):
+                    return
+        except Exception:
+            log.exception('Unable to compact legacy completed TS records')
 
     def close(self):
         self.stop_event.set(); self.wake.set()
@@ -862,16 +1202,23 @@ class DownloadManager:
 
     def scheduled_count(self):
         with self.db() as db:
-            return db.execute("SELECT count(*) FROM tasks WHERE status IN ('queued','downloading')").fetchone()[0]
+            return db.execute("""SELECT count(*) FROM tasks
+                               WHERE status IN ('waiting_collector','queued','downloading')""").fetchone()[0]
 
-    def status_counts(self):
-        with self.db() as db:
-            row = db.execute('''SELECT count(*) total,
-                                sum(CASE WHEN status IN ('queued','downloading') THEN 1 ELSE 0 END) active,
-                                sum(CASE WHEN status='completed' THEN 1 ELSE 0 END) completed,
-                                sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed
-                                FROM tasks''').fetchone()
-        return {key: int(row[key] or 0) for key in ('total', 'active', 'completed', 'failed')}
+    def status_counts(self, db=None):
+        if db is None:
+            with self.db() as connection:
+                return self.status_counts(connection)
+        rows = db.execute(
+            'SELECT status,count(*) total FROM tasks GROUP BY status').fetchall()
+        by_status = {row['status']: int(row['total'] or 0) for row in rows}
+        return {
+            'total': sum(by_status.values()),
+            'active': sum(by_status.get(status, 0) for status in (
+                'waiting_collector', 'queued', 'downloading')),
+            'completed': by_status.get('completed', 0),
+            'failed': by_status.get('failed', 0),
+        }
 
     def download_speed(self):
         return self.speed_meter.speed()
@@ -933,8 +1280,24 @@ class DownloadManager:
         self.public_base_url_updated_at = updated
         return self.public_url_settings()
 
+    def task_folder_path(self, source, video_id):
+        """Build a task path lexically without touching the filesystem."""
+        root = os.path.abspath(os.fspath(self.root))
+        folder = os.path.abspath(os.path.join(
+            root, self.source_directory(source), str(video_id)))
+        try:
+            contained = os.path.normcase(os.path.commonpath((root, folder))) == os.path.normcase(root)
+        except ValueError:
+            contained = False
+        if not contained or os.path.normcase(folder) == os.path.normcase(root):
+            raise DownloadError('任务资源目录不安全')
+        return Path(folder)
+
     def task_folder(self, source, video_id):
-        folder = (self.root / self.source_directory(source) / str(video_id)).resolve()
+        # Mutating/file-serving callers keep the symlink-aware check.  List
+        # serialization uses task_folder_path() to avoid one bind-mount stat
+        # chain for every displayed resource.
+        folder = self.task_folder_path(source, video_id).resolve()
         if folder == self.root or self.root not in folder.parents:
             raise DownloadError('任务资源目录不安全')
         return folder
@@ -1044,7 +1407,8 @@ class DownloadManager:
             if row:
                 task_id = row['id']
                 if row['status'] in ('pending', 'failed'):
-                    db.execute("UPDATE tasks SET status='queued',message='等待下载',error=NULL,url=?,updated=? WHERE id=?",
+                    db.execute("""UPDATE tasks SET status='queued',message='等待下载',error=NULL,
+                                  download_retry_at=0,url=?,updated=? WHERE id=?""",
                                (url,time.time(),task_id))
                 elif row['status'] == 'completed':
                     # Keep completed/100% visible while the worker checks missing optional assets.
@@ -1069,15 +1433,17 @@ class DownloadManager:
                     task_id, status = row['id'], row['status']
                     if status in ('pending', 'failed'):
                         status = 'queued'
-                        db.execute("UPDATE tasks SET status='queued',message='等待下载',error=NULL,url=?,updated=? WHERE id=?",
+                        db.execute("""UPDATE tasks SET status='queued',message='等待下载',error=NULL,
+                                      download_retry_at=0,url=?,updated=? WHERE id=?""",
                                    (entry['url'], time.time(), task_id))
                 else:
-                    task_id, status = uuid.uuid4().hex, 'queued'
+                    task_id = uuid.uuid4().hex
+                    status, message = 'queued', '等待下载'
                     now = time.time()
                     db.execute('''INSERT INTO tasks(id,source,video_id,url,status,message,
                                   first_seen,last_seen,created,updated) VALUES(?,?,?,?,?,?,?,?,?,?)''',
                                (task_id, entry['source'], entry['video_id'], entry['url'], status,
-                                '等待下载', now, now, now, now))
+                                message, now, now, now, now))
                 results.append(dict(item_id=entry.get('item_id'), task_id=task_id, status=status))
         self.wake.set()
         return results
@@ -1121,9 +1487,9 @@ class DownloadManager:
                     preview5_m3u8_file,
                     json.dumps(metadata,ensure_ascii=False), task_id))
 
-    def serialize_task(self, row, db=None):
+    def serialize_task(self, row, db=None, chapter_progress=None):
         total, done = row['total_segments'] or 0, row['downloaded_segments'] or 0
-        folder = self.task_folder(row['source'], row['video_id'])
+        folder = self.task_folder_path(row['source'], row['video_id'])
         try:
             metadata = json.loads(row['metadata_json'] or '{}')
         except (ValueError, TypeError):
@@ -1131,31 +1497,49 @@ class DownloadManager:
         chapters = []
         raw_chapters = metadata.get('chapters') if isinstance(metadata.get('chapters'), list) else []
         if raw_chapters:
-            connection = db
+            persisted_progress = (row['status'] == 'completed' and all(
+                isinstance(chapter, dict) and chapter.get('total_segments') is not None
+                for chapter in raw_chapters))
+            connection = None if persisted_progress or chapter_progress is not None else db
             close_connection = False
-            if connection is None:
+            if not persisted_progress and chapter_progress is None and connection is None:
                 connection = sqlite3.connect(self.database, timeout=30)
                 connection.row_factory = sqlite3.Row
                 close_connection = True
             try:
                 for index, chapter in enumerate(raw_chapters, 1):
-                    prefix = f'{index:02d}/' if len(raw_chapters) > 1 else ''
-                    progress = connection.execute('''SELECT
-                        sum(CASE WHEN kind='segment' THEN 1 ELSE 0 END) total,
-                        sum(CASE WHEN kind='segment' AND hash IS NOT NULL THEN 1 ELSE 0 END) done
-                        FROM files WHERE task_id=? AND path LIKE ?''',
-                        (row['id'], prefix + '%')).fetchone()
-                    chapter_total, chapter_done = int(progress['total'] or 0), int(progress['done'] or 0)
+                    if persisted_progress:
+                        chapter_total = int(chapter.get('total_segments') or 0)
+                        chapter_done = int(chapter.get('downloaded_segments') or 0)
+                        chapter_bytes = int(chapter.get('downloaded_bytes') or 0)
+                    else:
+                        prefix = f'{index:02d}/' if len(raw_chapters) > 1 else ''
+                        if chapter_progress is not None:
+                            progress = chapter_progress.get((row['id'], prefix)) or dict(
+                                total=0, done=0, bytes=0)
+                        else:
+                            progress = connection.execute('''SELECT
+                                sum(CASE WHEN kind='segment' THEN 1 ELSE 0 END) total,
+                                sum(CASE WHEN kind='segment' AND hash IS NOT NULL THEN 1 ELSE 0 END) done,
+                                coalesce(sum(CASE WHEN kind='segment' AND hash IS NOT NULL
+                                                 THEN size ELSE 0 END),0) bytes
+                                FROM files WHERE task_id=? AND path LIKE ?''',
+                                (row['id'], prefix + '%')).fetchone()
+                        chapter_total = int(progress['total'] or 0)
+                        chapter_done = int(progress['done'] or 0)
+                        chapter_bytes = int(progress['bytes'] or 0)
                     local_m3u8 = chapter.get('m3u8_local')
                     local_vtt = chapter.get('vtt_local')
                     local_preview = chapter.get('preview_m3u8_local')
                     local_preview5 = chapter.get('preview5_m3u8_local')
-                    completed = bool(chapter_total and chapter_done == chapter_total and local_m3u8)
+                    completed = bool(
+                        chapter_total and chapter_done == chapter_total and local_m3u8)
                     chapters.append(dict(
                         index=index, title=chapter.get('title') or f'第 {index} 章',
                         duration=chapter.get('duration'),
                         status='completed' if completed else ('downloading' if chapter_done else 'pending'),
                         downloaded_segments=chapter_done, total_segments=chapter_total,
+                        downloaded_bytes=chapter_bytes,
                         progress=100.0 if completed else round(chapter_done / chapter_total * 100, 2) if chapter_total else 0.0,
                         m3u8_url=self.media_url(row['source'], row['video_id'], local_m3u8) or chapter.get('m3u8_url'),
                         vtt_url=self.media_url(row['source'], row['video_id'], local_vtt) or chapter.get('vtt_url'),
@@ -1185,7 +1569,7 @@ class DownloadManager:
                     progress=100.0 if row['status']=='completed' else min(99.9,round(done/total*100,2)) if total else 0.0,
                     save_path=str(folder),playlist_path=str(folder/playlist_local) if row['status']=='completed' else None,
                     title=row['title'],poster_file=poster_file,
-                    cover_url=self.media_url(row['source'], row['video_id'], cover_file) or row['cover_url'],
+                    cover_url=self.media_url(row['source'], row['video_id'], cover_file) or row['cover_url'] or metadata.get('poster'),
                     preview_file=preview_file,
                     preview_url=self.media_url(row['source'], row['video_id'], preview_file) or row['preview_url'],
                     vtt_file=vtt_file,
@@ -1195,6 +1579,9 @@ class DownloadManager:
                     preview_m3u8_url=self.media_url(row['source'], row['video_id'], preview_m3u8_file) or row['preview_m3u8_url'],
                     preview5_m3u8_file=preview5_m3u8_file,
                     preview5_m3u8_url=self.media_url(row['source'], row['video_id'], preview5_m3u8_file) or row['preview5_m3u8_url'],
+                    published_at=row['release_date'] or metadata.get('published_at'),
+                    actors=metadata.get('actors') if isinstance(metadata.get('actors'), list) else [],
+                    tags=metadata.get('tags') if isinstance(metadata.get('tags'), list) else [],
                     chapters=chapters,
                     message=row['message'],error=row['error'],warnings=json.loads(row['warnings']),
                     created_at=row['created'],updated_at=row['updated'])
@@ -1207,8 +1594,59 @@ class DownloadManager:
             with self.db() as connection:
                 return self.get_many(task_ids, connection)
         placeholders = ','.join('?' for _ in task_ids)
-        rows = db.execute(f'SELECT * FROM tasks WHERE id IN ({placeholders})', task_ids).fetchall()
-        return {row['id']: self.serialize_task(row, db) for row in rows}
+        rows = db.execute(
+            f'SELECT {self.TASK_RESPONSE_COLUMNS} FROM tasks WHERE id IN ({placeholders})',
+            task_ids).fetchall()
+        chapter_progress = self.chapter_progress(db, rows)
+        return {
+            row['id']: self.serialize_task(row, db=db, chapter_progress=chapter_progress)
+            for row in rows
+        }
+
+    @staticmethod
+    def chapter_progress(db, rows):
+        """Load unfinished multi-chapter progress for a task batch in one query."""
+        task_ids = []
+        for row in rows:
+            if '"chapters"' not in (row['metadata_json'] or ''):
+                continue
+            try:
+                metadata = json.loads(row['metadata_json'] or '{}')
+            except (TypeError, ValueError):
+                continue
+            chapters = metadata.get('chapters')
+            if not isinstance(chapters, list) or not chapters:
+                continue
+            persisted = row['status'] == 'completed' and all(
+                isinstance(chapter, dict) and chapter.get('total_segments') is not None
+                for chapter in chapters)
+            if not persisted:
+                task_ids.append(row['id'])
+        if not task_ids:
+            return {}
+        progress, task_totals = {}, {}
+        for offset in range(0, len(task_ids), 500):
+            chunk = task_ids[offset:offset + 500]
+            marks = ','.join('?' for _ in chunk)
+            results = db.execute(f'''SELECT task_id,
+                CASE WHEN instr(path,'/')>0
+                     THEN substr(path,1,instr(path,'/')) ELSE '' END chapter_prefix,
+                count(*) total,
+                sum(CASE WHEN hash IS NOT NULL THEN 1 ELSE 0 END) done,
+                coalesce(sum(CASE WHEN hash IS NOT NULL THEN size ELSE 0 END),0) bytes
+                FROM files WHERE kind='segment' AND task_id IN ({marks})
+                GROUP BY task_id,chapter_prefix''', chunk).fetchall()
+            for row in results:
+                value = dict(row)
+                progress[(row['task_id'], row['chapter_prefix'])] = value
+                total = task_totals.setdefault(
+                    row['task_id'], dict(total=0, done=0, bytes=0))
+                total['total'] += int(row['total'] or 0)
+                total['done'] += int(row['done'] or 0)
+                total['bytes'] += int(row['bytes'] or 0)
+        for task_id, total in task_totals.items():
+            progress[(task_id, '')] = total
+        return progress
 
     def get(self, task_id):
         return self.get_many([task_id]).get(task_id)
@@ -1226,7 +1664,7 @@ class DownloadManager:
             total = db.execute('SELECT count(*) FROM tasks' + clause, values).fetchone()[0]
             rows = db.execute('SELECT id FROM tasks' + clause + ' ORDER BY created DESC LIMIT ? OFFSET ?',
                               (*values, limit, offset)).fetchall()
-        tasks = self.get_many([row['id'] for row in rows])
+            tasks = self.get_many([row['id'] for row in rows], db)
         return total, [tasks[row['id']] for row in rows if row['id'] in tasks]
 
     def exists(self, source, video_id):
@@ -1272,10 +1710,10 @@ class DownloadManager:
 
     def state(self, task_id, status, error=None):
         with self.db() as db:
-            self.rebuild_progress(db, task_id)
             message = error if error else {'queued':'等待下载','failed':'下载失败'}.get(status)
             db.execute('UPDATE tasks SET status=?,message=?,error=?,updated=? WHERE id=?',
                        (status,message,error,time.time(),task_id))
+            self.rebuild_progress(db, task_id)
 
     def run(self, worker_index=0):
         while not self.stop_event.is_set():
@@ -1286,12 +1724,21 @@ class DownloadManager:
                 break
             row = None
             with self.dispatch_lock:
+                local_available = bool(self.collector_available and self.collector_available())
+                with self.active_condition:
+                    active = tuple(self.active_tasks)
                 with self.db() as db:
-                    row = db.execute("""SELECT * FROM tasks
-                                        WHERE status='queued' OR assets_refresh IN (1,3)
-                                        ORDER BY assets_refresh DESC,created LIMIT 1""").fetchone()
-                    if row and row['status'] == 'queued':
-                        db.execute("UPDATE tasks SET status='downloading',message='准备下载',updated=? WHERE id=?",
+                    db.execute('BEGIN IMMEDIATE')
+                    marks = ','.join('?' for _ in active)
+                    exclusion = f' AND id NOT IN ({marks})' if active else ''
+                    row = db.execute("""SELECT * FROM tasks WHERE (
+                        (status IN ('queued','waiting_collector') AND download_retry_at<=?
+                         AND (local_collect_enabled=0 OR ?)) OR assets_refresh IN (1,3))"""
+                        + exclusion + ' ORDER BY assets_refresh DESC,created,id LIMIT 1',
+                        (time.time(), int(local_available), *active)).fetchone()
+                    if row and row['status'] in ('queued', 'waiting_collector'):
+                        db.execute("""UPDATE tasks SET status='downloading',message='准备下载',
+                                      download_retry_at=0,error=NULL,updated=? WHERE id=?""",
                                    (time.time(), row['id']))
                     elif row:
                         working_mode = 4 if row['assets_refresh'] == 3 else 2
@@ -1309,11 +1756,32 @@ class DownloadManager:
                     continue
                 for attempt in range(3):
                     try:
-                        self.download(dict(row)); break
+                        with self.db() as db:
+                            latest = db.execute('SELECT * FROM tasks WHERE id=?', (row['id'],)).fetchone()
+                        if not latest:
+                            raise Cancelled()
+                        task = dict(latest)
+                        if task['local_collect_enabled']:
+                            if not self.collector_resolver:
+                                raise PreparationDeferred('等待代理采集服务初始化')
+                            self.collector_resolver(task)
+                            with self.db() as db:
+                                latest = db.execute('SELECT * FROM tasks WHERE id=?', (row['id'],)).fetchone()
+                            if not latest:
+                                raise Cancelled()
+                            task = dict(latest)
+                        self.download(task); break
                     except Stopped:
                         raise
                     except Cancelled:
                         raise
+                    except (PreparationDeferred, PlanChanged):
+                        raise
+                    except ExpiredSource:
+                        if attempt == 2:
+                            raise
+                        self.task_message(row['id'], f'播放地址可能过期，正在第 {attempt + 1} 次更新地址并续传')
+                        if self.stop_event.wait(2): raise Stopped()
                     except Exception:
                         if attempt == 2: raise
                         if self.stop_event.wait(2): raise Stopped()
@@ -1321,6 +1789,11 @@ class DownloadManager:
                 self.state(row['id'],'queued')
             except Cancelled:
                 pass
+            except PreparationDeferred as exc:
+                with self.db() as db:
+                    db.execute("""UPDATE tasks SET status='waiting_collector',message=?,error=NULL,
+                                  download_retry_at=?,updated=? WHERE id=?""",
+                               (str(exc), time.time() + 30, time.time(), row['id']))
             except Exception as exc:
                 # Do not persist exception text containing signed URLs or credentials.
                 message = str(exc) if isinstance(exc, DownloadError) else '下载失败：'+type(exc).__name__
@@ -1340,6 +1813,7 @@ class DownloadManager:
                 transport = HttpTransport(session, metadata.get('url'))
                 yield metadata, SigningTransport(transport, self.signers, task) if self.signers else transport
         else:
+            self.task_message(task['id'], '正在获取最新播放地址')
             with self.resolver(task['url']) as (metadata, transport):
                 yield metadata, SigningTransport(transport, self.signers, task) if self.signers else transport
 
@@ -1376,7 +1850,28 @@ class DownloadManager:
         try:
             previous = json.loads(task.get('metadata_json') or '{}')
         except (ValueError, TypeError):
-            return metadata
+            previous = {}
+        column_fields = {
+            'title': 'title', 'duration': 'duration', 'published_at': 'release_date',
+            'cover': 'cover_url', 'preview_image': 'preview_url',
+            'vtt_url': 'vtt_url', 'm3u8_url': 'm3u8_url',
+            'preview_m3u8_url': 'preview_m3u8_url',
+            'preview5_m3u8_url': 'preview5_m3u8_url',
+        }
+        for field, column in column_fields.items():
+            if not metadata.get(field) and task.get(column):
+                metadata[field] = task[column]
+        column_local_fields = {
+            'poster_local': 'poster_file', 'preview_image_local': 'preview_file',
+            'vtt_local': 'vtt_file', 'preview_m3u8_local': 'preview_m3u8_file',
+            'preview5_m3u8_local': 'preview5_m3u8_file',
+        }
+        for local, column in column_local_fields.items():
+            if task.get(column):
+                metadata.setdefault(local, task[column])
+        for field in ('actors', 'tags'):
+            if not metadata.get(field) and previous.get(field):
+                metadata[field] = previous[field]
         local_fields = {'cover': 'cover_local', 'poster': 'poster_local',
                         'preview_image': 'preview_image_local', 'vtt_url': 'vtt_local',
                         'preview_m3u8_url': 'preview_m3u8_local',
@@ -1393,8 +1888,10 @@ class DownloadManager:
         if previous_chapters and not current_chapters:
             metadata['chapters'] = previous_chapters
         elif previous_chapters and current_chapters:
-            chapter_local_fields = ('m3u8_local', 'vtt_local', 'preview_m3u8_local',
-                                    'preview5_m3u8_local')
+            chapter_local_fields = (
+                'm3u8_local', 'vtt_local', 'preview_m3u8_local',
+                'preview5_m3u8_local', 'total_segments', 'downloaded_segments',
+                'downloaded_bytes', 'download_progress', 'download_status')
             for index, chapter in enumerate(current_chapters):
                 if not isinstance(chapter, dict) or index >= len(previous_chapters):
                     continue
@@ -1434,16 +1931,18 @@ class DownloadManager:
                             path.stat().st_size, checksum.hexdigest()))
 
     def generate_import_previews(self, task, folder, metadata, warnings):
-        """Generate short playlists and fill missing assets for imported videos."""
+        """Generate short playlists and fill missing local preview assets."""
         imported = bool(metadata.get('_imported'))
+        preview_settings = self.preview_generation_settings()
         first_local = metadata.get('m3u8_local') or 'index.m3u8'
         source = folder / first_local
         if not source.is_file():
             return warnings
         need_cover = imported and not metadata.get('cover_local')
         need_poster = imported and not metadata.get('poster_local')
-        need_hover = imported and not metadata.get('preview_image_local')
-        need_vtt = imported and not metadata.get('vtt_local')
+        need_hover = (preview_settings['hover'] and not metadata.get('preview_image_local'))
+        need_vtt = (imported and preview_settings['vtt']
+                    and not metadata.get('vtt_local'))
         duration = None
         if need_cover or need_poster or need_hover or need_vtt:
             duration = self.preview_generator.duration(source)
@@ -1558,7 +2057,7 @@ class DownloadManager:
         with self.db() as db:
             old_fingerprint = fingerprints.get(key)
             if old_fingerprint and old_fingerprint != plan['fingerprint']:
-                raise DownloadError(f'第 {chapter_number} 章分片结构已变化，保留原文件，禁止混合不同版本')
+                raise PlanChanged(f'第 {chapter_number} 章分片结构已变化，保留原文件，禁止混合不同版本')
             fingerprints[key] = plan['fingerprint']
             db.execute('UPDATE tasks SET plan=?,updated=? WHERE id=?',
                        (json.dumps({'chapters': fingerprints}), time.time(), task['id']))
@@ -1582,7 +2081,7 @@ class DownloadManager:
                     current_key = self.file_downloader.fetch(
                         task['id'], transport, resource['url'], limit=1024, resource_type='key')
                     if digest(current_key) != saved['hash']:
-                        raise DownloadError('来源密钥已变化，禁止混合不同版本')
+                        raise PlanChanged('来源密钥已变化，禁止混合不同版本')
                 continue
             with self.db() as db:
                 db.execute('UPDATE files SET hash=NULL,size=0 WHERE task_id=? AND path=?',
@@ -1655,6 +2154,9 @@ class DownloadManager:
         folder = self.task_folder(task['source'], task['video_id'])
         folder.mkdir(parents=True, exist_ok=True)
         with self.task_source(task) as (metadata, transport):
+            # List pages often provide the hover preview while detail pages do not.
+            # Preserve those task columns before downloading the optional assets.
+            metadata = self.merge_existing_metadata(task, metadata)
             chapters = metadata.get('chapters') if isinstance(metadata.get('chapters'), list) else []
             if not chapters:
                 chapters = [dict(index=1, title='第 1 章', duration=metadata.get('duration'),
@@ -1712,6 +2214,7 @@ class DownloadManager:
                 self.rebuild_progress(db, task['id'])
                 db.execute("UPDATE tasks SET status='completed',message='下载完成',error=NULL,warnings=?,updated=? WHERE id=?",
                            (json.dumps(list(dict.fromkeys(warnings)), ensure_ascii=False), time.time(), task['id']))
+                self.compact_completed_segments(db, task['id'], metadata)
             self.notify_completed(task, metadata, folder)
 
     def assets(self, task, folder, metadata, transport,
@@ -1782,7 +2285,10 @@ class DownloadManager:
                     if '-->' not in line: continue
                     if i+1 >= len(lines): raise DownloadError('VTT 索引不完整')
                     reference = lines[i+1].strip()
-                    remote = urljoin(base,reference.split('#',1)[0])
+                    ref = reference.split('#',1)[0]
+                    resolved_base = getattr(transport, 'resolved_urls', {}).get(base, base)
+                    resolver = getattr(transport, 'resolve_asset_url', None)
+                    remote = resolver(ref, resolved_base, 'vtt_image') if resolver else urljoin(resolved_base, ref)
                     if remote not in images:
                         number = len(images) + 1
                         # Keep every VTT sprite beside the video, with names that

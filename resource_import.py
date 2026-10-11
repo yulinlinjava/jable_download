@@ -1,6 +1,6 @@
 """Validate pasted resource metadata without accepting internal task fields."""
 import re
-from datetime import date
+from datetime import date, datetime
 from urllib.parse import urlsplit
 
 
@@ -19,14 +19,14 @@ def resource_url(value, field):
         if not isinstance(value, str) or len(value) > 8192 or re.search(r'[\s\\\x00-\x1f]', value):
             raise ValueError()
         parts = urlsplit(value)
-        relative_local = not parts.scheme and not parts.netloc and parts.path.startswith('/')
+        relative_local = not parts.scheme and not parts.netloc and bool(parts.path)
         absolute_http = (parts.scheme in ('http', 'https') and bool(parts.hostname)
                          and not parts.username and not parts.password)
         if not (relative_local or absolute_http) or parts.fragment:
             raise ValueError()
         parts.port
     except (ValueError, TypeError):
-        raise ValueError(f'{field} 必须是 HTTP/HTTPS 地址或以 / 开头的本地公开路径') from None
+        raise ValueError(f'{field} 必须是 HTTP/HTTPS 地址或相对资源路径') from None
     return value
 
 
@@ -66,11 +66,18 @@ def validate_resource(value):
     published = value.get('published_at')
     if published is not None:
         try:
-            if not isinstance(published, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', published):
+            if not isinstance(published, str):
                 raise ValueError()
-            date.fromisoformat(published)
+            if re.fullmatch(r'\d{4}-\d{2}-\d{2}', published):
+                date.fromisoformat(published)
+            elif re.fullmatch(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}', published):
+                datetime.fromisoformat(published.replace(' ', 'T'))
+                published = published.replace('T', ' ')
+            else:
+                raise ValueError()
         except ValueError:
-            raise ValueError('published_at 必须是有效的 YYYY-MM-DD 日期或 null') from None
+            raise ValueError(
+                'published_at 必须是有效的 YYYY-MM-DD 或 YYYY-MM-DD HH:mm:ss') from None
     result['published_at'] = published
     chapters = value.get('chapters', [])
     if chapters is None:

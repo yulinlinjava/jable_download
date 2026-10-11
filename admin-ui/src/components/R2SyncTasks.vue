@@ -9,12 +9,20 @@ const loading = ref(false), total = ref(0), tasks = ref<R2SyncTask[]>([])
 const selected = ref<R2SyncTask[]>([]), table = ref()
 const settings = ref<R2Settings>({
   enabled: false, endpointUrl: '', accessKeyId: '', hasSecretAccessKey: false,
-  bucket: '', publicBaseUrl: '', pathPrefix: '', concurrency: 1, maxConcurrency: 16,
-  fileConcurrency: 3, maxFileConcurrency: 16, autoUpload: false, autoCollection: false,
+  bucket: '', publicBaseUrl: '', pathPrefix: '', maxConcurrency: 16,
+  maxFileConcurrency: 16, videoConcurrency: 1, videoFileConcurrency: 3,
+  otherConcurrency: 3, otherFileConcurrency: 3,
+  autoUpload: false, autoCollection: false, cleanupEnabled: false, retentionDays: 7,
 })
-const query = reactive({ page: 1, page_size: 20, keyword: '', status: '', resource_type: '' })
+const query = reactive({ page: 1, page_size: 20, keyword: '', status: '', resource_type: '', sync_group: '' })
 const counts = reactive<Record<string, number>>({ queued: 0, running: 0, completed: 0, failed: 0 })
+const groupCounts = reactive<Record<'video' | 'other', Record<string, number>>>({
+  video: { queued: 0, running: 0, completed: 0, failed: 0 },
+  other: { queued: 0, running: 0, completed: 0, failed: 0 },
+})
 let timer: number | undefined
+let loadPromise: Promise<void> | undefined
+let pollingGeneration = 0
 
 const retryable = computed(() => selected.value.filter(item => item.status === 'failed'))
 const deletable = computed(() => selected.value.filter(item => item.status !== 'running'))
@@ -26,7 +34,8 @@ const formatBytes = (value?: number) => {
 }
 const formatTime = (value?: number) => value
   ? new Date(value * 1000).toLocaleString('zh-CN', { hour12: false }) : '—'
-const statusText = (value: string) => ({
+const statusText = (value: string, nextRetryAt?: number) => nextRetryAt && value === 'queued'
+  ? '等待重试' : ({
   queued: '等待同步', running: '同步中', completed: '已完成', failed: '失败',
 }[value] || value)
 const statusType = (value: string) => ({
@@ -34,19 +43,29 @@ const statusType = (value: string) => ({
 }[value] || 'info') as any
 
 async function load(silent = false) {
-  if (!silent) loading.value = true
-  try {
-    const [taskResponse, settingResponse] = await Promise.all([
-      api.get('/r2/tasks', { params: query }), api.get('/r2/settings'),
-    ])
-    tasks.value = taskResponse.data.data.items
-    total.value = taskResponse.data.data.total
-    Object.assign(counts, { queued: 0, running: 0, completed: 0, failed: 0 },
-      taskResponse.data.data.counts || {})
-    settings.value = settingResponse.data.data
-  } catch (error: any) {
-    if (!silent) ElMessage.error(error.message)
-  } finally { if (!silent) loading.value = false }
+  if (loadPromise) return loadPromise
+  const request = (async () => {
+    if (!silent) loading.value = true
+    try {
+      const [taskResponse, settingResponse] = await Promise.all([
+        api.get('/r2/tasks', { params: query }), api.get('/r2/settings'),
+      ])
+      tasks.value = taskResponse.data.data.items
+      total.value = taskResponse.data.data.total
+      Object.assign(counts, { queued: 0, running: 0, completed: 0, failed: 0 },
+        taskResponse.data.data.counts || {})
+      Object.assign(groupCounts.video, { queued: 0, running: 0, completed: 0, failed: 0 },
+        taskResponse.data.data.groupCounts?.video || {})
+      Object.assign(groupCounts.other, { queued: 0, running: 0, completed: 0, failed: 0 },
+        taskResponse.data.data.groupCounts?.other || {})
+      settings.value = settingResponse.data.data
+    } catch (error: any) {
+      if (!silent) ElMessage.error(error.message)
+    } finally { if (!silent) loading.value = false }
+  })()
+  loadPromise = request
+  try { await request }
+  finally { if (loadPromise === request) loadPromise = undefined }
 }
 function search() { query.page = 1; table.value?.clearSelection(); selected.value = []; load() }
 async function retry(ids: string[]) {
@@ -67,11 +86,25 @@ async function remove(ids: string[]) {
     await load(true)
   } catch (error: any) { ElMessage.error(error.message) }
 }
-function stopPolling() { if (timer) window.clearInterval(timer); timer = undefined }
-watch(() => props.active, active => {
+function stopPolling() {
+  pollingGeneration += 1
+  if (timer) window.clearTimeout(timer)
+  timer = undefined
+}
+async function poll(generation: number, silent = false) {
+  if (!props.active || generation !== pollingGeneration) return
+  await load(silent)
+  if (props.active && generation === pollingGeneration) {
+    timer = window.setTimeout(() => void poll(generation, true), 2500)
+  }
+}
+function startPolling() {
   stopPolling()
-  if (active) { load(); timer = window.setInterval(() => load(true), 2500) }
-}, { immediate: true })
+  if (!props.active) return
+  const generation = pollingGeneration
+  void poll(generation)
+}
+watch(() => props.active, startPolling, { immediate: true })
 onBeforeUnmount(stopPolling)
 </script>
 
@@ -82,8 +115,10 @@ onBeforeUnmount(stopPolling)
         <div><h2>CF R2资源同步日志</h2><p>统一查看采集资源与上传资源的异步同步进度，不阻塞本地下载、上传和视频处理。</p></div>
         <div class="panel-actions">
           <el-tag v-if="!settings.enabled" type="info" size="large">未启用</el-tag>
-          <el-tag v-else-if="settings.concurrency===0" type="warning" size="large">调度已暂停</el-tag>
-          <el-tag v-else type="success" size="large">已启用 · 并发 {{settings.concurrency}}</el-tag>
+          <template v-else>
+            <el-tag :type="settings.videoConcurrency===0?'warning':'success'" size="large">视频{{settings.videoConcurrency===0?'已暂停':`并发 ${settings.videoConcurrency}`}}</el-tag>
+            <el-tag :type="settings.otherConcurrency===0?'warning':'success'" size="large">其他{{settings.otherConcurrency===0?'已暂停':`并发 ${settings.otherConcurrency}`}}</el-tag>
+          </template>
           <el-tag v-if="settings.autoUpload" type="success" effect="plain">上传自动同步</el-tag>
           <el-tag v-if="settings.autoCollection" type="success" effect="plain">采集自动同步</el-tag>
           <span class="secondary-cell">配置请在顶部“系统配置”中修改</span>
@@ -97,6 +132,10 @@ onBeforeUnmount(stopPolling)
       <div><span>已完成</span><strong>{{counts.completed}}</strong></div>
       <div><span>失败</span><strong>{{counts.failed}}</strong></div>
     </div>
+    <div class="r2-group-counts secondary-cell">
+      视频组：同步中 {{groupCounts.video.running}} · 等待 {{groupCounts.video.queued}} · 失败 {{groupCounts.video.failed}}
+      <span>其他组：同步中 {{groupCounts.other.running}} · 等待 {{groupCounts.other.queued}} · 失败 {{groupCounts.other.failed}}</span>
+    </div>
 
     <div class="filters ffmpeg-filters">
       <el-input v-model="query.keyword" clearable :prefix-icon="Search" placeholder="搜索文件名、资源ID或对象路径" @keyup.enter="search" @clear="search"/>
@@ -107,6 +146,9 @@ onBeforeUnmount(stopPolling)
       <el-select v-model="query.resource_type" clearable placeholder="全部来源" @change="search">
         <el-option label="采集资源" value="collection"/><el-option label="上传资源" value="upload"/>
       </el-select>
+      <el-select v-model="query.sync_group" clearable placeholder="全部同步组" @change="search">
+        <el-option label="视频组" value="video"/><el-option label="其他组" value="other"/>
+      </el-select>
       <el-button :icon="Refresh" @click="load()">刷新</el-button>
       <el-button :icon="RefreshLeft" :disabled="!retryable.length" @click="retry(retryable.map(item=>item.id))">批量重试（{{retryable.length}}）</el-button>
       <el-button type="danger" plain :icon="Delete" :disabled="!deletable.length" @click="remove(deletable.map(item=>item.id))">删除日志（{{deletable.length}}）</el-button>
@@ -116,8 +158,9 @@ onBeforeUnmount(stopPolling)
     <el-table ref="table" v-loading="loading" :data="tasks" row-key="id"
               empty-text="暂无R2同步日志" @selection-change="selected=$event">
       <el-table-column type="selection" width="48" reserve-selection/>
+      <el-table-column label="同步组" width="92"><template #default="{row}"><el-tag :type="row.syncGroup==='video'?'primary':'success'" effect="plain">{{row.syncGroup==='video'?'视频':'其他'}}</el-tag></template></el-table-column>
       <el-table-column label="资源" min-width="350"><template #default="{row}"><div class="primary-cell line-clamp">{{row.title || row.fileName}}</div><div class="secondary-cell"><el-tag size="small" effect="plain">{{row.resourceType==='collection'?'采集资源':'上传资源'}}</el-tag> {{row.source || row.fileType}} · {{row.resourceId}}</div><div class="secondary-cell line-clamp">{{row.objectKey || '—'}}</div></template></el-table-column>
-      <el-table-column label="状态与进度" min-width="250"><template #default="{row}"><div class="task-status-line"><el-tag :type="statusType(row.status)">{{statusText(row.status)}}</el-tag><span>{{Math.round(row.progress)}}%</span></div><el-progress :percentage="Math.round(row.progress)" :status="row.status==='failed'?'exception':row.status==='completed'?'success':undefined"/><div v-if="row.error" class="error-text">{{row.error}}</div><div v-else class="secondary-cell">{{row.message}}</div></template></el-table-column>
+      <el-table-column label="状态与进度" min-width="270"><template #default="{row}"><div class="task-status-line"><el-tag :type="statusType(row.status)">{{statusText(row.status,row.nextRetryAt)}}</el-tag><span>{{Math.round(row.progress)}}%</span></div><el-progress :percentage="Math.round(row.progress)" :status="row.status==='failed'?'exception':row.status==='completed'?'success':undefined"/><div v-if="row.nextRetryAt" class="secondary-cell">第 {{row.retryCount}} / {{row.maxAutoRetries}} 次自动重试 · {{formatTime(row.nextRetryAt)}}</div><div v-if="row.error" class="error-text">{{row.error}}</div><div v-else class="secondary-cell">{{row.message}}</div></template></el-table-column>
       <el-table-column label="文件" width="170"><template #default="{row}"><div>{{row.syncedFiles}} / {{row.totalFiles}} 个</div><div class="secondary-cell">{{formatBytes(row.syncedBytes)}} / {{formatBytes(row.totalBytes)}}</div></template></el-table-column>
       <el-table-column label="R2地址" min-width="260"><template #default="{row}"><a v-if="row.publicUrl" :href="row.publicUrl" target="_blank" rel="noopener" class="table-link">{{row.publicUrl}}</a><span v-else class="secondary-cell">未配置公开地址</span></template></el-table-column>
       <el-table-column label="更新" width="175"><template #default="{row}">{{formatTime(row.updatedAt)}}</template></el-table-column>

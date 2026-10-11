@@ -18,6 +18,54 @@ def text(node):
     return (node.get_text(' ', strip=True) or None) if node else None
 
 
+def model_name(link):
+    """Read a Jable model name from text or its tooltip-only avatar."""
+    if not link:
+        return None
+    # Jable sometimes renders only a shortened visible name (for example
+    # "泉") while keeping the complete model name on an avatar or placeholder
+    # tooltip ("泉ももか"). The tooltip is therefore the authoritative value.
+    tooltip = link if link.get('data-original-title') else link.select_one('[data-original-title]')
+    if tooltip:
+        value = (tooltip.get('data-original-title') or '').strip()
+        if value:
+            return value
+    name = text(link)
+    if name:
+        return name
+    for node in (link, link.select_one('img, span')):
+        if not node:
+            continue
+        for attribute in ('title', 'alt'):
+            value = (node.get(attribute) or '').strip()
+            if value:
+                return value
+    return None
+
+
+def localized_model_names(title, links):
+    """Prefer the localized model names appended to a Jable video title."""
+    resolved = [(link, model_name(link)) for link in links]
+    resolved = [(link, name) for link, name in resolved if name]
+    fallback = list(dict.fromkeys(name for _, name in resolved))
+    if not title or not fallback:
+        return fallback
+    clean_title = re.sub(r'\s*-\s*Jable(?:\.TV)?.*$', '', title, flags=re.I).strip()
+    parts = [part.strip(' ,，、') for part in re.split(r'\s+', clean_title) if part.strip(' ,，、')]
+    count = len(fallback)
+    if len(parts) < count:
+        return fallback
+    candidates = parts[-count:]
+    if any(not value or len(value) > 40 or '://' in value for value in candidates):
+        return fallback
+    for candidate, (link, fallback_name) in zip(candidates, resolved):
+        visible_name = text(link)
+        clue = visible_name or fallback_name
+        if clue and candidate != clue and clue not in candidate and candidate not in clue:
+            return fallback
+    return list(dict.fromkeys(candidates))
+
+
 def meta(soup, key):
     node = soup.find('meta', attrs={'property': key}) or soup.find('meta', attrs={'name': key})
     return (node.get('content') or None) if node else None
@@ -127,10 +175,13 @@ def parse_detail(source, url):
         thumb = thumb[0] if thumb else None
     time_node = soup.select_one('time[datetime]')
     video = soup.select_one('video[poster]')
+    heading_title = text(soup.select_one('h1, h4.video-title, h4.title'))
+    detail_title = meta(soup, 'og:title') or heading_title or structured.get('name')
+    model_links = soup.select('a[href*="/models/"]')
     has_vtt, vtt_url = progress_preview(soup, url)
     return dict(
         id=urlsplit(url).path.rstrip('/').split('/')[-1],
-        title=meta(soup, 'og:title') or text(soup.select_one('h1, h4.video-title, h4.title')) or structured.get('name'),
+        title=detail_title,
         url=url,
         cover=absolute(url, meta(soup, 'og:image') or thumb),
         poster=absolute(url, video.get('poster')) if video else None,
@@ -139,7 +190,9 @@ def parse_detail(source, url):
         vtt_url=vtt_url,
         duration=meta(soup, 'video:duration') or structured.get('duration') or text(soup.select_one('.video-info .duration')),
         published_at=visible_publish_date(soup) or structured.get('uploadDate') or meta(soup, 'article:published_time') or (time_node.get('datetime') if time_node else None),
-        actors=list(dict.fromkeys(filter(None, [text(a) or a.get('title') for a in soup.select('a[href*="/models/"]')]))),
-        tags=list(dict.fromkeys(filter(None, [text(a) for a in soup.select('a[href*="/tags/"]')]))),
+        actors=localized_model_names(heading_title or detail_title, model_links),
+        tags=list(dict.fromkeys(filter(None, [
+            text(a) for a in soup.select('a[href*="/categories/"], a[href*="/tags/"]')
+        ]))),
         m3u8_url=extract_m3u8(source),
     )

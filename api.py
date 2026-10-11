@@ -7,16 +7,17 @@ import time
 import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qsl
+from urllib.parse import unquote, urljoin, urlsplit, urlunsplit, parse_qsl
 
 import requests
 from fastapi import Body, Depends, FastAPI, File, Form, Query, Security, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import APIKeyHeader
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware.cors import CORSMiddleware
 
 from config import headers
@@ -55,7 +56,70 @@ if TIMEOUT <= 0:
     raise ValueError('JABLE_TIMEOUT must be positive')
 API_KEY = os.getenv('JABLE_API_KEY', 'yes@1234') or 'yes@1234'
 DOWNLOAD_ROOT = Path(os.getenv('DOWNLOAD_DIR', str(Path(__file__).parent / 'downloads'))).resolve()
+LEGACY_DATABASE_PATH = DOWNLOAD_ROOT / 'tasks.sqlite3'
+DATABASE_PATH = Path(os.getenv('DATABASE_PATH') or LEGACY_DATABASE_PATH).resolve()
+DATABASE_BACKUP_PATH = Path(os.getenv('DATABASE_BACKUP_PATH') or (
+    LEGACY_DATABASE_PATH if DATABASE_PATH != LEGACY_DATABASE_PATH
+    else DOWNLOAD_ROOT / 'tasks.backup.sqlite3')).resolve()
 logger = logging.getLogger(__name__)
+
+
+class UploadPreviewFiles(StaticFiles):
+    """Serve upload files locally and transparently fall back to private R2."""
+
+    def __init__(self, *, directory, relative_root, manager_getter):
+        super().__init__(directory=directory)
+        self.relative_root = relative_root.strip('/')
+        self.manager_getter = manager_getter
+
+    async def get_response(self, path, scope):
+        try:
+            return await super().get_response(path, scope)
+        except HTTPException as exc:
+            if exc.status_code != 404 or scope.get('method') not in ('GET', 'HEAD'):
+                raise
+        clean = unquote(str(path or '')).replace('\\', '/').lstrip('/')
+        if not clean or any(part in ('', '.', '..') for part in clean.split('/')):
+            raise HTTPException(status_code=404)
+        manager = self.manager_getter()
+        if manager is None:
+            raise HTTPException(status_code=404)
+        request_headers = {key.lower(): value for key, value in scope.get('headers', [])}
+        byte_range = request_headers.get(b'range')
+        try:
+            remote = await run_in_threadpool(
+                manager.open_preview_object,
+                f'{self.relative_root}/{clean}',
+                byte_range.decode('latin-1') if byte_range else None,
+                scope.get('method') == 'HEAD')
+        except FileNotFoundError:
+            raise HTTPException(status_code=404) from None
+        except ValueError as exc:
+            return Response(str(exc), status_code=416,
+                            media_type='text/plain; charset=utf-8')
+        except Exception as exc:
+            logger.exception('Unable to read upload preview from R2')
+            return Response('R2 文件读取失败：' + str(exc)[:240], status_code=502,
+                            media_type='text/plain; charset=utf-8')
+        if scope.get('method') == 'HEAD':
+            body = remote.get('body')
+            if body is not None:
+                body.close()
+            return Response(status_code=remote['status'], headers=remote['headers'],
+                            media_type=remote['media_type'])
+
+        body = remote['body']
+
+        def stream():
+            try:
+                for chunk in body.iter_chunks(chunk_size=256 * 1024):
+                    if chunk:
+                        yield chunk
+            finally:
+                body.close()
+
+        return StreamingResponse(stream(), status_code=remote['status'],
+                                 headers=remote['headers'], media_type=remote['media_type'])
 
 
 @asynccontextmanager
@@ -67,9 +131,17 @@ async def lifespan(app):
     from resource_sync import ResourceSyncManager
     from r2_sync import R2SyncManager
     from system_monitor import SystemMonitor
-    app.state.downloads = DownloadManager(DOWNLOAD_ROOT, start_enabled=False)
+    from local_collectors import LocalCollectorManager
+    from player_proxy import PlayerProxyManager
+    app.state.downloads = DownloadManager(
+        DOWNLOAD_ROOT, start_enabled=False, database=DATABASE_PATH,
+        legacy_database=LEGACY_DATABASE_PATH)
+    app.state.player_proxy = PlayerProxyManager(app.state.downloads.database)
     app.state.download_signers = DownloadSignerManager(app.state.downloads.database)
     app.state.downloads.signers = app.state.download_signers
+    from resource_preview import ResourcePreviewManager
+    app.state.resource_preview = ResourcePreviewManager(
+        app.state.download_signers, app.state.player_proxy, app.state.downloads, API_KEY)
     app.state.r2_sync = R2SyncManager(DOWNLOAD_ROOT, app.state.downloads.database)
     app.state.downloads.completion_callback = app.state.r2_sync.enqueue_download
     app.state.uploads = UploadManager(
@@ -90,10 +162,23 @@ async def lifespan(app):
         app.state.downloads.database, app.state.collections.export_items,
         resolve_resource_for_sync)
     app.state.collections.node_enqueue_callback = app.state.resource_sync.enqueue_node_items
+    app.state.collections.site_enqueue_callback = app.state.resource_sync.enqueue_site_items
+    def download_completed(task, metadata, folder):
+        try:
+            app.state.r2_sync.enqueue_download(task, metadata, folder)
+        except Exception:
+            logger.exception('Unable to enqueue completed resource for R2 synchronization')
+        try:
+            app.state.resource_sync.enqueue_completed_download(task)
+        except Exception:
+            logger.exception('Unable to enqueue completed resource for website synchronization')
+    app.state.downloads.completion_callback = download_completed
     app.state.collections.start()
+    app.state.local_collectors = LocalCollectorManager(app.state.downloads.database)
     try:
         yield
     finally:
+        app.state.local_collectors.close()
         app.state.system_monitor.close()
         app.state.resource_sync.close()
         await __import__('asyncio').to_thread(app.state.collections.close)
@@ -105,17 +190,23 @@ async def lifespan(app):
 
 app = FastAPI(title='JableTVDownload API', version='1.3.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=['*'],
-                   allow_methods=['*'], allow_headers=['Range', 'Content-Type', 'X-API-Key'],
-                   expose_headers=['Accept-Ranges', 'Content-Length', 'Content-Range'])
+                   allow_methods=['*'], allow_headers=['Range', 'Content-Type', 'X-API-Key', 'X-Collector-Token'],
+                   expose_headers=['Accept-Ranges', 'Content-Length', 'Content-Range',
+                                   'Server-Timing'])
 for public_path, relative_path in (
-        ('/jable', 'jable'), ('/123', '123'), ('/external', 'external'),
-        ('/uploads/video', 'uploads/video'),
-        ('/uploads/image', 'uploads/image'),
-        ('/uploads/other', 'uploads/other')):
+        ('/jable', 'jable'), ('/123', '123'), ('/external', 'external')):
     static_directory = DOWNLOAD_ROOT / relative_path
     static_directory.mkdir(parents=True, exist_ok=True)
     app.mount(public_path, StaticFiles(directory=static_directory),
               name='media-' + public_path.lstrip('/'))
+for category in ('video', 'image', 'other'):
+    relative_path = f'uploads/{category}'
+    static_directory = DOWNLOAD_ROOT / relative_path
+    static_directory.mkdir(parents=True, exist_ok=True)
+    app.mount(f'/uploads/{category}', UploadPreviewFiles(
+        directory=static_directory, relative_root=relative_path,
+        manager_getter=lambda: getattr(app.state, 'r2_sync', None)),
+        name='media-uploads-' + category)
 key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 browser_slot = threading.BoundedSemaphore(1)
 browser_state_lock = threading.RLock()
@@ -572,6 +663,9 @@ class DownloadTask(BaseModel):
     preview_m3u8_url: str | None = None
     preview5_m3u8_file: str | None = None
     preview5_m3u8_url: str | None = None
+    published_at: str | None = None
+    actors: list[str] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
     chapters: list[dict] = Field(default_factory=list)
     message: str | None = None
     error: str | None
@@ -629,7 +723,7 @@ def download_progress(task_id: str, request: Request):
 @app.get('/api/downloads', response_model=DownloadListResponse, dependencies=[Depends(authorize)])
 def download_list(request: Request, status: str | None = Query(None), search: str | None = Query(None, max_length=100),
                   limit: int = Query(100, ge=1, le=500), offset: int = Query(0, ge=0)):
-    if status and status not in {'pending', 'queued', 'downloading', 'completed', 'failed', 'deleting'}:
+    if status and status not in {'pending', 'waiting_collector', 'queued', 'downloading', 'completed', 'failed', 'deleting'}:
         raise APIError(400, 40001, '下载状态参数无效')
     total, items = request.app.state.downloads.list(status, search, limit, offset)
     return dict(code=0, message='ok', data=dict(total=total, items=items))
@@ -688,26 +782,43 @@ def download_file(task_id: str, relative: str, request: Request, token: str | No
     return FileResponse(target, media_type=media_types.get(target.suffix.lower()), headers=headers)
 
 
-class CollectionInput(BaseModel):
+class CollectionApiOptions(BaseModel):
+    collection_type: str = Field('webpage', pattern='^(webpage|api)$', description='网页列表或JSON接口')
+    api_source: str = Field('', max_length=100, description='响应缺少source时使用的默认来源')
+    request_method: str = Field('GET', pattern='^(GET|POST)$')
+    request_headers: dict[str, str] = Field(default_factory=dict)
+    request_body: object | None = None
+    request_timeout: int = Field(30, ge=5, le=120)
+
+
+class CollectionInput(CollectionApiOptions):
     name: str | None = Field(None, max_length=80)
-    url: str = Field(min_length=1, max_length=2048, description='Jable 或 123AV 列表页链接')
+    url: str = Field(min_length=1, max_length=8192, description='网页列表地址或HTTP/HTTPS JSON接口')
     batch_size: int = Field(1, ge=1, le=20, description='兼容字段；列表采集始终保存当前页全部数据')
     scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
     r2_sync_enabled: bool = Field(False, description='资源下载完成后自动同步到R2')
+    local_collect_enabled: bool = Field(False, description='列表和资源详情交给采集客户端解析')
+    auto_download_enabled: bool = Field(False, description='列表采集完成后立即加入下载调度')
     node_ids: list[str] = Field(default_factory=list, max_length=20,
                                 description='采集成功后立即调度到这些下载节点')
+    sync_site_ids: list[str] = Field(default_factory=list, max_length=20,
+                                     description='资源下载完成后自动发送到这些同步网站')
 
 
-class CollectionBulkInput(BaseModel):
+class CollectionBulkInput(CollectionApiOptions):
     name: str | None = Field(None, max_length=80)
-    url_template: str = Field(min_length=1, max_length=2048,
-                              description='包含 ${page} 的 Jable 或 123AV 列表页链接模板')
+    url_template: str = Field(min_length=1, max_length=8192,
+                              description='网页列表需包含 ${page}；API 地址也可在 POST 请求 JSON 中使用变量')
     start_page: int = Field(ge=1, le=100000)
     end_page: int = Field(ge=1, le=100000)
     scheduled_enabled: bool = Field(False, description='每天北京时间 18:00 自动采集')
     r2_sync_enabled: bool = Field(False, description='资源下载完成后自动同步到R2')
+    local_collect_enabled: bool = Field(False, description='列表和资源详情交给采集客户端解析')
+    auto_download_enabled: bool = Field(False, description='列表采集完成后立即加入下载调度')
     node_ids: list[str] = Field(default_factory=list, max_length=20,
                                 description='所有批量任务共用的下载节点')
+    sync_site_ids: list[str] = Field(default_factory=list, max_length=20,
+                                     description='所有批量任务共用的同步网站')
 
 
 class CollectionTask(BaseModel):
@@ -715,9 +826,21 @@ class CollectionTask(BaseModel):
     name: str
     url: str
     batch_size: int
+    collection_type: str = 'webpage'
+    api_source: str = ''
+    request_method: str = 'GET'
+    request_headers: dict = Field(default_factory=dict)
+    request_body: object | None = None
+    request_timeout: int = 30
+    last_updated: int = 0
+    last_failed: int = 0
     scheduled_enabled: bool = False
     r2_sync_enabled: bool = False
+    local_collect_enabled: bool = False
+    auto_download_enabled: bool = False
     node_ids: list[str] = Field(default_factory=list)
+    sync_site_ids: list[str] = Field(default_factory=list)
+    sync_sites: list[dict] = Field(default_factory=list)
     last_scheduled_date: str | None = None
     status: str
     last_total: int
@@ -726,6 +849,9 @@ class CollectionTask(BaseModel):
     last_node_queued: int = 0
     last_node_skipped: int = 0
     last_node_failed: int = 0
+    last_download_queued: int = 0
+    last_download_skipped: int = 0
+    last_download_failed: int = 0
     last_task_ids: list[str]
     last_error: str | None
     last_run_at: float | None
@@ -733,8 +859,32 @@ class CollectionTask(BaseModel):
     updated_at: float
 
 
-def collection_url(url):
+def collection_url(url, collection_type='webpage'):
+    if collection_type == 'api':
+        from api_collection import validate_api_url, ApiCollectionError
+        try:
+            return validate_api_url(url)
+        except ApiCollectionError as exc:
+            raise APIError(400, 40007, str(exc)) from None
     return validate_url(url)
+
+
+def collection_api_options(body):
+    from api_collection import validate_options, ApiCollectionError
+    try:
+        return validate_options(**body.model_dump(include=set(CollectionApiOptions.model_fields)))
+    except ApiCollectionError as exc:
+        raise APIError(400, 40007, str(exc)) from None
+
+
+def contains_page_template(value):
+    if isinstance(value, str):
+        return '${page}' in value
+    if isinstance(value, list):
+        return any(contains_page_template(item) for item in value)
+    if isinstance(value, dict):
+        return any(contains_page_template(item) for item in value.values())
+    return False
 
 
 def collection_node_ids(request, node_ids):
@@ -745,6 +895,230 @@ def collection_node_ids(request, node_ids):
         raise APIError(400, 40031, str(exc)) from None
 
 
+def collection_site_ids(request, site_ids):
+    from resource_sync import SyncError
+    try:
+        return request.app.state.resource_sync.validate_site_ids(site_ids)
+    except SyncError as exc:
+        raise APIError(400, 40032, str(exc)) from None
+
+
+class CollectorNodeInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    enabled: bool = True
+
+
+class CollectorLeaseInput(BaseModel):
+    lease_token: str = Field(min_length=1, max_length=80)
+
+
+class CollectorCompleteInput(CollectorLeaseInput):
+    result: dict
+
+
+class CollectorFailInput(CollectorLeaseInput):
+    error: str = Field(min_length=1, max_length=500)
+
+
+class LocalCollectorInput(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    server_url: str = Field(min_length=1, max_length=2048)
+    token: str | None = Field(default=None, min_length=22, max_length=22)
+    concurrency: int = Field(default=1, ge=1, le=10)
+    auto_start: bool = False
+
+
+class LocalCollectorIdsInput(BaseModel):
+    ids: list[str] = Field(min_length=1, max_length=100)
+
+
+collector_token_header = APIKeyHeader(name='X-Collector-Token', auto_error=False)
+
+
+def authorize_collector(request: Request, token: str | None = Security(collector_token_header)):
+    node = request.app.state.collections.authenticate_collector(token)
+    if node is None:
+        raise APIError(401, 40140, '采集节点Token无效')
+    return node
+
+
+@app.get('/api/collector/check')
+def collector_check(request: Request, node: dict = Depends(authorize_collector)):
+    request.app.state.collections.heartbeat_collector(node['id'])
+    return dict(code=0, message='ok', data=node)
+
+
+@app.get('/api/collector-nodes', dependencies=[Depends(authorize)])
+def collector_node_list(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.collections.list_collector_nodes(include_token=True))
+
+
+@app.post('/api/collector-nodes', dependencies=[Depends(authorize)])
+def collector_node_create(body: CollectorNodeInput, request: Request):
+    from collection_tasks import CollectionError
+    try:
+        result = request.app.state.collections.create_collector_node(body.name, body.enabled)
+    except CollectionError as exc:
+        raise APIError(400, 40040, str(exc)) from None
+    return dict(code=0, message='ok', data=result)
+
+
+@app.put('/api/collector-nodes/{node_id}', dependencies=[Depends(authorize)])
+def collector_node_update(node_id: str, body: CollectorNodeInput, request: Request):
+    from collection_tasks import CollectionError
+    try:
+        result = request.app.state.collections.update_collector_node(node_id, body.name, body.enabled)
+    except CollectionError as exc:
+        raise APIError(400, 40040, str(exc)) from None
+    if not result:
+        raise APIError(404, 40440, '采集节点不存在')
+    return dict(code=0, message='ok', data=dict(id=node_id))
+
+
+@app.post('/api/collector-nodes/{node_id}/rotate-token', dependencies=[Depends(authorize)])
+def collector_node_rotate(node_id: str, request: Request):
+    result = request.app.state.collections.rotate_collector_token(node_id)
+    if not result:
+        raise APIError(404, 40440, '采集节点不存在')
+    return dict(code=0, message='ok', data=result)
+
+
+@app.delete('/api/collector-nodes/{node_id}', dependencies=[Depends(authorize)])
+def collector_node_delete(node_id: str, request: Request):
+    if not request.app.state.collections.delete_collector_node(node_id):
+        raise APIError(404, 40440, '采集节点不存在')
+    return dict(code=0, message='ok', data=dict(id=node_id))
+
+
+@app.get('/api/collector/nodes', dependencies=[Depends(authorize)])
+def collector_nodes(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.collections.list_collector_nodes())
+
+
+@app.post('/api/collector/jobs/claim')
+def collector_claim(request: Request, node: dict = Depends(authorize_collector)):
+    from collection_tasks import CollectionError
+    try:
+        job = request.app.state.collections.claim_collector_job(
+            node['id'])
+    except CollectionError as exc:
+        raise APIError(400, 40040, str(exc)) from None
+    return dict(code=0, message='ok', data=job)
+
+
+@app.post('/api/collector/jobs/{job_id}/heartbeat')
+def collector_heartbeat(job_id: str, body: CollectorLeaseInput, request: Request,
+                        node: dict = Depends(authorize_collector)):
+    if not request.app.state.collections.heartbeat_collector(
+            node['id'], job_id, body.lease_token):
+        raise APIError(409, 40940, '采集任务租约已失效')
+    return dict(code=0, message='ok', data=dict(job_id=job_id, active=True))
+
+
+@app.post('/api/collector/jobs/{job_id}/complete')
+def collector_complete(job_id: str, body: CollectorCompleteInput, request: Request,
+                       node: dict = Depends(authorize_collector)):
+    from collection_tasks import CollectionError
+    try:
+        result = request.app.state.collections.complete_collector_job(
+            job_id, node['id'], body.lease_token, body.result)
+    except CollectionError as exc:
+        raise APIError(409, 40940, str(exc)) from None
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/collector/jobs/{job_id}/fail')
+def collector_fail(job_id: str, body: CollectorFailInput, request: Request,
+                   node: dict = Depends(authorize_collector)):
+    if not request.app.state.collections.fail_collector_job(
+            job_id, node['id'], body.lease_token, body.error):
+        raise APIError(409, 40940, '采集任务租约已失效')
+    return dict(code=0, message='ok', data=dict(job_id=job_id, failed=True))
+
+
+@app.get('/api/local-collectors', dependencies=[Depends(authorize)])
+def local_collector_list(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.local_collectors.list())
+
+
+@app.post('/api/local-collectors', dependencies=[Depends(authorize)])
+def local_collector_create(body: LocalCollectorInput, request: Request):
+    from local_collectors import LocalCollectorError
+    try:
+        result = request.app.state.local_collectors.create(body.model_dump())
+    except LocalCollectorError as exc:
+        raise APIError(400, 40041, str(exc)) from None
+    return dict(code=0, message='saved', data=result)
+
+
+@app.put('/api/local-collectors/{config_id}', dependencies=[Depends(authorize)])
+def local_collector_update(config_id: str, body: LocalCollectorInput, request: Request):
+    from local_collectors import LocalCollectorError
+    try:
+        result = request.app.state.local_collectors.update(config_id, body.model_dump())
+    except LocalCollectorError as exc:
+        raise APIError(409, 40941, str(exc)) from None
+    if result is None:
+        raise APIError(404, 40441, '采集客户端不存在')
+    return dict(code=0, message='saved', data=result)
+
+
+@app.delete('/api/local-collectors/{config_id}', dependencies=[Depends(authorize)])
+def local_collector_delete(config_id: str, request: Request):
+    from local_collectors import LocalCollectorError
+    try:
+        deleted = request.app.state.local_collectors.delete(config_id)
+    except LocalCollectorError as exc:
+        raise APIError(409, 40941, str(exc)) from None
+    if not deleted:
+        raise APIError(404, 40441, '采集客户端不存在')
+    return dict(code=0, message='deleted', data=dict(id=config_id, deleted=True))
+
+
+@app.post('/api/local-collectors/{config_id}/test', dependencies=[Depends(authorize)])
+def local_collector_test(config_id: str, request: Request):
+    from local_collectors import LocalCollectorError
+    try:
+        result = request.app.state.local_collectors.test(config_id)
+    except LocalCollectorError as exc:
+        raise APIError(400, 40041, str(exc)) from None
+    if result is None:
+        raise APIError(404, 40441, '采集客户端不存在')
+    return dict(code=0, message='connected', data=result)
+
+
+@app.post('/api/local-collectors/{config_id}/start', dependencies=[Depends(authorize)])
+def local_collector_start(config_id: str, request: Request):
+    from local_collectors import LocalCollectorError
+    try:
+        result = request.app.state.local_collectors.start(config_id)
+    except LocalCollectorError as exc:
+        raise APIError(409, 40941, str(exc)) from None
+    if result is None:
+        raise APIError(404, 40441, '采集客户端不存在')
+    return dict(code=0, message='started', data=result)
+
+
+@app.post('/api/local-collectors/{config_id}/stop', dependencies=[Depends(authorize)])
+def local_collector_stop(config_id: str, request: Request):
+    result = request.app.state.local_collectors.stop(config_id)
+    if result is None:
+        raise APIError(404, 40441, '采集客户端不存在')
+    return dict(code=0, message='stopping', data=result)
+
+
+@app.post('/api/local-collectors/bulk-start', dependencies=[Depends(authorize)])
+def local_collector_bulk_start(body: LocalCollectorIdsInput, request: Request):
+    return dict(code=0, message='started',
+                data=request.app.state.local_collectors.bulk(body.ids, 'start'))
+
+
+@app.post('/api/local-collectors/bulk-stop', dependencies=[Depends(authorize)])
+def local_collector_bulk_stop(body: LocalCollectorIdsInput, request: Request):
+    return dict(code=0, message='stopping',
+                data=request.app.state.local_collectors.bulk(body.ids, 'stop'))
+
+
 @app.get('/api/collections', dependencies=[Depends(authorize)])
 def collection_list(request: Request, page: int = Query(1, ge=1),
                     page_size: int = Query(20, ge=1, le=100),
@@ -752,34 +1126,49 @@ def collection_list(request: Request, page: int = Query(1, ge=1),
                     status: str | None = Query(None),
                     scheduled_enabled: bool | None = Query(None),
                     source: str | None = Query(None)):
-    if status and status not in {'idle', 'queued', 'running'}:
+    if status and status not in {'idle', 'queued', 'running', 'waiting_collector'}:
         raise APIError(400, 40001, '采集任务状态筛选参数无效')
     if source and source not in {'jable', '123av', 'other'}:
         raise APIError(400, 40001, '采集任务来源筛选参数无效')
     result = request.app.state.collections.list(
         page, page_size, keyword.strip() if keyword else None,
         status, scheduled_enabled, source)
-    request.app.state.resource_sync.attach_collection_nodes(result['items'])
+    request.app.state.resource_sync.attach_collection_destinations(result['items'])
     return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/collections/options', dependencies=[Depends(authorize)])
+def collection_options(request: Request):
+    """Return all data needed by the create/edit collection dialog."""
+    return dict(code=0, message='ok', data=dict(
+        r2_enabled=bool(request.app.state.r2_sync.settings().get('enabled')),
+        collector_nodes=request.app.state.collections.list_collector_nodes(),
+        sync_sites=request.app.state.resource_sync.list_sites(),
+        download_signers=request.app.state.download_signers.list_options()))
 
 
 @app.post('/api/collections', dependencies=[Depends(authorize)])
 def collection_create(body: CollectionInput, request: Request):
     if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
         raise APIError(400, 40030, '请先配置并启用R2')
-    url = collection_url(body.url)
-    name = (body.name or '').strip() or f'{provider(url)} 列表采集'
+    url = collection_url(body.url, body.collection_type)
+    name = (body.name or '').strip() or ('API接口采集' if body.collection_type=='api' else f'{provider(url)} 列表采集')
     node_ids = collection_node_ids(request, body.node_ids)
     return dict(code=0, message='ok', data=request.app.state.collections.create(
-        name, url, body.batch_size, body.scheduled_enabled, body.r2_sync_enabled, node_ids))
+        name, url, body.batch_size, body.scheduled_enabled, body.r2_sync_enabled,
+        node_ids, body.local_collect_enabled, body.auto_download_enabled,
+        collection_site_ids(request, body.sync_site_ids), **collection_api_options(body)))
 
 
 @app.post('/api/collections/bulk-create', dependencies=[Depends(authorize)])
 def collection_bulk_create(body: CollectionBulkInput, request: Request):
     if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
         raise APIError(400, 40030, '请先配置并启用R2')
-    if '${page}' not in body.url_template:
-        raise APIError(400, 40007, '批量链接模板必须包含 ${page}')
+    url_has_page = '${page}' in body.url_template
+    body_has_page = (body.collection_type == 'api' and body.request_method == 'POST'
+                     and contains_page_template(body.request_body))
+    if not url_has_page and not body_has_page:
+        raise APIError(400, 40007, '批量任务的链接或请求 JSON 至少一处必须包含 ${page}')
     if body.end_page < body.start_page:
         raise APIError(400, 40007, '结束页不能小于起始页')
     if body.end_page - body.start_page + 1 > 500:
@@ -788,11 +1177,13 @@ def collection_bulk_create(body: CollectionBulkInput, request: Request):
     node_ids = collection_node_ids(request, body.node_ids)
     tasks = []
     for page in range(body.start_page, body.end_page + 1):
-        url = collection_url(body.url_template.replace('${page}', str(page)))
-        prefix = base_name or f'{provider(url)} 列表采集'
+        url = collection_url(body.url_template.replace('${page}', str(page)), body.collection_type)
+        prefix = base_name or ('API接口采集' if body.collection_type=='api' else f'{provider(url)} 列表采集')
         tasks.append(dict(page=page, name=f'{prefix} - 第 {page} 页', url=url))
     result = request.app.state.collections.create_many(
-        tasks, body.scheduled_enabled, body.r2_sync_enabled, node_ids)
+        tasks, body.scheduled_enabled, body.r2_sync_enabled, node_ids,
+        body.local_collect_enabled, body.auto_download_enabled,
+        collection_site_ids(request, body.sync_site_ids), **collection_api_options(body))
     return dict(code=0, message='ok', data=result)
 
 
@@ -803,10 +1194,14 @@ def collection_update(task_id: str, body: CollectionInput, request: Request):
         if body.r2_sync_enabled and not request.app.state.r2_sync.settings()['enabled']:
             raise APIError(400, 40030, '请先配置并启用R2')
         result = request.app.state.collections.update(task_id, (body.name or '').strip() or '列表采集',
-                                                      collection_url(body.url), body.batch_size,
+                                                      collection_url(body.url, body.collection_type), body.batch_size,
                                                       body.scheduled_enabled,
                                                       body.r2_sync_enabled,
-                                                      collection_node_ids(request, body.node_ids))
+                                                      collection_node_ids(request, body.node_ids),
+                                                      body.local_collect_enabled,
+                                                      body.auto_download_enabled,
+                                                      collection_site_ids(request,
+                                                                          body.sync_site_ids), **collection_api_options(body))
     except CollectionError as exc:
         raise APIError(409, 40902, str(exc))
     if result is None:
@@ -844,13 +1239,20 @@ class DownloadSignerInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     source: str = Field(min_length=1, max_length=100)
     enabled: bool = True
-    code: str = Field(min_length=1, max_length=100000)
+    code: str = Field('', max_length=100000)
     config: dict = Field(default_factory=dict)
+    image_base_url: str = Field('', max_length=8192)
+    video_base_url: str = Field('', max_length=8192)
+    format_code: str = Field('', max_length=100000)
 
 
 class DownloadSignerTestInput(DownloadSignerInput):
     url: str = Field(min_length=1, max_length=8192)
     resource_type: str = Field('playlist', min_length=1, max_length=50)
+
+
+class DownloadFormatterTestInput(DownloadSignerInput):
+    raw: object
 
 
 @app.post('/api/collections/bulk-execute', dependencies=[Depends(authorize)])
@@ -877,19 +1279,51 @@ def collection_delete(task_id: str, request: Request):
 
 
 @app.get('/api/collection-items', dependencies=[Depends(authorize)])
-def collection_item_list(request: Request, page: int = Query(1, ge=1),
+def collection_item_list(request: Request, response: Response,
+                         page: int = Query(1, ge=1),
                          page_size: int = Query(20, ge=1, le=100),
-                         title: str | None = Query(None, max_length=100),
+                         title: str | None = Query(None, max_length=8192),
                          source: str | None = Query(None), status: str | None = Query(None),
-                         collection_id: str | None = Query(None, max_length=32)):
+                         collection_id: str | None = Query(None, max_length=32),
+                         include_sync_state: bool = Query(True, alias='includeSyncState')):
     if source and not re.fullmatch(r'[a-zA-Z0-9_-]{1,100}', source):
         raise APIError(400, 40001, '来源筛选参数无效')
-    if status and status not in {'pending', 'queued', 'downloading', 'completed', 'failed'}:
+    if status and status not in {'pending', 'waiting_collector', 'queued', 'downloading', 'completed', 'failed'}:
         raise APIError(400, 40001, '资源状态筛选参数无效')
-    result = request.app.state.collections.list_items(page, page_size, title, source, status, collection_id)
-    request.app.state.resource_sync.attach_node_statuses(result['items'])
-    result['node_queue'] = request.app.state.resource_sync.node_queue_summary()
+    from collection_tasks import CollectionError
+    started = time.perf_counter()
+    try:
+        result = request.app.state.collections.list_items(
+            page, page_size, title, source, status, collection_id)
+    except CollectionError as exc:
+        raise APIError(400, 40001, str(exc))
+    listed = time.perf_counter()
+    if include_sync_state:
+        result['node_queue'] = request.app.state.resource_sync.collection_item_node_state(
+            result['items'])
+    else:
+        for item in result['items']:
+            item['synced_nodes'] = []
+        result['node_queue'] = dict(queued=0, processing=0, succeeded=0, failed=0)
+    synced = time.perf_counter()
+    request.app.state.resource_preview.decorate_list(result['items'])
+    decorated = time.perf_counter()
+    response.headers['Server-Timing'] = (
+        f'items;dur={(listed - started) * 1000:.1f}, '
+        f'sync;dur={(synced - listed) * 1000:.1f}, '
+        f'preview;dur={(decorated - synced) * 1000:.1f}, '
+        f'total;dur={(decorated - started) * 1000:.1f}')
     return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/collection-items/{task_id}/playback', dependencies=[Depends(authorize)])
+def collection_item_playback(task_id: str, request: Request):
+    task = request.app.state.downloads.get(task_id)
+    if not task:
+        raise APIError(404, 40402, '资源不存在')
+    if not task.get('m3u8_url'):
+        raise APIError(409, 40902, '来源尚未提供播放地址，请先采集详情')
+    return dict(code=0, message='ok', data=request.app.state.resource_preview.playback(task))
 
 
 @app.get('/api/import-scripts', dependencies=[Depends(authorize)])
@@ -942,10 +1376,27 @@ def download_signer_test(body: DownloadSignerTestInput, request: Request):
     try:
         result = request.app.state.download_signers.test(
             body.name, body.source, body.enabled, body.code, body.config,
-            body.url, body.resource_type)
+            body.url, body.resource_type, body.image_base_url, body.video_base_url, body.format_code)
     except SignerError as exc:
         raise APIError(400, 40008, str(exc))
     return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/download-signers/format-test', dependencies=[Depends(authorize)])
+def download_formatter_test(body: DownloadFormatterTestInput, request: Request):
+    from download_signers import SignerError
+    manager = request.app.state.download_signers
+    try:
+        name, source, enabled, code, config = manager.validate(
+            body.name, body.source, body.enabled, body.code, body.config)
+        image_base, video_base, format_code = manager.validate_options(
+            body.image_base_url, body.video_base_url, body.format_code)
+        definition = dict(source=source, enabled=enabled, code=code, config=config,
+                          format_code=format_code, image_base_url=image_base, video_base_url=video_base)
+        items = manager.format_items(body.raw, source, definition=definition)
+    except SignerError as exc:
+        raise APIError(400, 40008, str(exc)) from None
+    return dict(code=0, message='ok', data=dict(items=items, total=len(items)))
 
 
 @app.post('/api/download-signers', dependencies=[Depends(authorize)])
@@ -953,7 +1404,8 @@ def download_signer_create(body: DownloadSignerInput, request: Request):
     from download_signers import SignerError
     try:
         result = request.app.state.download_signers.create(
-            body.name, body.source, body.enabled, body.code, body.config)
+            body.name, body.source, body.enabled, body.code, body.config,
+            body.image_base_url, body.video_base_url, body.format_code)
     except SignerError as exc:
         raise APIError(409, 40908, str(exc))
     return dict(code=0, message='created', data=result)
@@ -966,7 +1418,8 @@ def download_signer_update(signer_id: str, body: DownloadSignerInput, request: R
         raise APIError(404, 40408, '签名脚本不存在')
     try:
         result = request.app.state.download_signers.update(
-            signer_id, body.name, body.source, body.enabled, body.code, body.config)
+            signer_id, body.name, body.source, body.enabled, body.code, body.config,
+            body.image_base_url, body.video_base_url, body.format_code)
     except SignerError as exc:
         raise APIError(409, 40908, str(exc))
     if result is None:
@@ -984,17 +1437,29 @@ def download_signer_delete(signer_id: str, request: Request):
 
 
 @app.post('/api/collection-items/import/validate', dependencies=[Depends(authorize)])
-def collection_item_import_validate(request: Request, body: list = Body(...)):
-    if not 1 <= len(body) <= 1000:
-        raise APIError(400, 40001, '请提交包含 1–1000 条资源的 JSON 数组')
-    return dict(code=0, message='ok', data=request.app.state.collections.validate_import_items(body))
+def collection_item_import_validate(request: Request, body: object = Body(...),
+                                    source: str | None = Query(None, max_length=100),
+                                    format: bool = Query(True)):
+    items = prepare_import_items(request, body, source, format)
+    result = request.app.state.collections.validate_import_items(items)
+    result['items'] = items
+    return dict(code=0, message='ok', data=result)
+
+
+def prepare_import_items(request, raw, source=None, apply_format=True):
+    from download_signers import SignerError
+    try:
+        return request.app.state.download_signers.format_items(raw, source, apply_format)
+    except SignerError as exc:
+        raise APIError(400, 40008, str(exc)) from None
 
 
 @app.post('/api/collection-items/import', dependencies=[Depends(authorize)])
-def collection_item_import(request: Request, body: list = Body(...)):
-    if not 1 <= len(body) <= 1000:
-        raise APIError(400, 40001, '请提交包含 1–1000 条资源的 JSON 数组')
-    return dict(code=0, message='ok', data=request.app.state.collections.import_items(body))
+def collection_item_import(request: Request, body: object = Body(...),
+                           source: str | None = Query(None, max_length=100),
+                           format: bool = Query(True)):
+    items = prepare_import_items(request, body, source, format)
+    return dict(code=0, message='ok', data=request.app.state.collections.import_items(items))
 
 
 @app.post('/api/collection-items/export', dependencies=[Depends(authorize)])
@@ -1010,9 +1475,29 @@ def collection_item_export(body: ResourceIdsInput, request: Request):
     })
 
 
+@app.post('/api/collection-items/{item_id}/refresh-detail', dependencies=[Depends(authorize)])
+def collection_item_refresh_detail(item_id: str, request: Request):
+    if not re.fullmatch(r'[a-f0-9]{32}', item_id):
+        raise APIError(404, 40405, '采集资源不存在')
+    result = request.app.state.collections.refresh_details([item_id], resolve_detail)
+    if result['failed'] and result['results'][0].get('message') == '资源不存在':
+        raise APIError(404, 40405, '采集资源不存在')
+    return dict(code=0, message='ok', data=result)
+
+
+@app.post('/api/collection-items/bulk-refresh-detail', dependencies=[Depends(authorize)])
+def collection_item_bulk_refresh_detail(body: BulkIdsInput, request: Request):
+    return dict(code=0, message='ok',
+                data=request.app.state.collections.refresh_details(body.ids, resolve_detail))
+
+
 @app.post('/api/collection-items/{item_id}/download', dependencies=[Depends(authorize)])
 def collection_item_download(item_id: str, request: Request):
-    result = request.app.state.collections.schedule_item(item_id)
+    from collection_tasks import CollectionError
+    try:
+        result = request.app.state.collections.schedule_item(item_id)
+    except CollectionError as exc:
+        raise APIError(409, 40902, str(exc)) from None
     if result is None:
         raise APIError(404, 40405, '采集资源不存在')
     return dict(code=0, message='queued', data=result)
@@ -1046,18 +1531,63 @@ class PublicBaseUrlInput(BaseModel):
                      description='公开访问根地址，例如 http://localhost:8000')
 
 
+class PlayerProxySettingsInput(BaseModel):
+    enabled: bool = False
+
+
+def scheduler_settings_data(request: Request):
+    result = request.app.state.collections.settings()
+    speeds = request.app.state.r2_sync.upload_speeds()
+    result['upload_speed'] = speeds['total']
+    result['video_upload_speed'] = speeds['video']
+    result['other_upload_speed'] = speeds['other']
+    return result
+
+
 @app.get('/api/settings/scheduler', dependencies=[Depends(authorize)])
 def scheduler_settings(request: Request):
-    result = request.app.state.collections.settings()
-    result['upload_speed'] = request.app.state.r2_sync.upload_speed()
+    result = scheduler_settings_data(request)
     return dict(code=0, message='ok', data=result)
+
+
+@app.get('/api/settings/all', dependencies=[Depends(authorize)])
+def all_settings(request: Request):
+    """Load the management settings dialog with one HTTP request."""
+    return dict(code=0, message='ok', data=dict(
+        publicUrl=request.app.state.downloads.public_url_settings(),
+        scheduler=scheduler_settings_data(request),
+        ffmpeg=request.app.state.uploads.ffmpeg_settings(),
+        compression=request.app.state.uploads.compression_settings(),
+        imageCompression=request.app.state.uploads.image_compression_settings(),
+        chunkCleanup=request.app.state.uploads.chunk_cleanup_settings(),
+        database=request.app.state.downloads.database_settings(DATABASE_BACKUP_PATH),
+        r2=request.app.state.r2_sync.settings()))
+
+
+@app.get('/api/database/settings', dependencies=[Depends(authorize)])
+def database_settings(request: Request):
+    return dict(code=0, message='ok', data=
+                request.app.state.downloads.database_settings(DATABASE_BACKUP_PATH))
+
+
+@app.post('/api/database/backup', dependencies=[Depends(authorize)])
+def database_backup(request: Request):
+    from download_tasks import DownloadError
+    try:
+        result = request.app.state.downloads.backup_database(DATABASE_BACKUP_PATH)
+    except DownloadError as exc:
+        raise APIError(409, 40910, str(exc)) from None
+    return dict(code=0, message='数据库备份完成', data=result)
 
 
 @app.put('/api/settings/scheduler', dependencies=[Depends(authorize)])
 def scheduler_settings_update(body: SchedulerSettingsInput, request: Request):
     result = request.app.state.collections.update_settings(
         body.enabled, body.concurrency, body.segment_concurrency)
-    result['upload_speed'] = request.app.state.r2_sync.upload_speed()
+    speeds = request.app.state.r2_sync.upload_speeds()
+    result['upload_speed'] = speeds['total']
+    result['video_upload_speed'] = speeds['video']
+    result['other_upload_speed'] = speeds['other']
     return dict(code=0, message='ok', data=result)
 
 
@@ -1075,13 +1605,92 @@ def public_url_settings_update(body: PublicBaseUrlInput, request: Request):
     return dict(code=0, message='ok', data=result)
 
 
+@app.get('/api/player-proxy/settings', dependencies=[Depends(authorize)])
+def player_proxy_settings(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.player_proxy.settings())
+
+
+@app.put('/api/player-proxy/settings', dependencies=[Depends(authorize)])
+def player_proxy_settings_update(body: PlayerProxySettingsInput, request: Request):
+    result = request.app.state.player_proxy.set_enabled(body.enabled)
+    return dict(code=0, message='ok', data=result)
+
+
+@app.api_route('/api/player/proxy', methods=['GET', 'HEAD'])
+async def player_proxy(request: Request,
+                       url: str = Query(min_length=1, max_length=8192),
+                       referer: str | None = Query(None, max_length=8192)):
+    """Public only while the global player proxy switch is enabled."""
+    from player_proxy import PlayerProxyError
+    range_header = request.headers.get('range')
+    try:
+        remote = await run_in_threadpool(
+            request.app.state.player_proxy.open,
+            url, request.method, range_header, referer)
+    except PlayerProxyError as exc:
+        error_codes = {400: 40040, 403: 40301, 416: 41601, 502: 50210}
+        raise APIError(exc.status_code, error_codes.get(exc.status_code, 50210),
+                       str(exc)) from None
+    manager = request.app.state.player_proxy
+    return media_proxy_response(manager, remote, check_enabled=True)
+
+
+@app.api_route('/api/source-media', methods=['GET', 'HEAD'])
+async def source_media(request: Request,
+                       source: str = Query(min_length=1, max_length=100),
+                       url: str = Query(min_length=1, max_length=8192),
+                       resource_type: str = Query(max_length=50),
+                       token: str = Query(max_length=200)):
+    """Resource-specific media grants; all child requests are signed at request time."""
+    from player_proxy import PlayerProxyError
+    try:
+        remote = await run_in_threadpool(request.app.state.resource_preview.open,
+            source, url, resource_type, token, request.method, request.headers.get('range'))
+    except PlayerProxyError as exc:
+        raise APIError(exc.status_code, 40101 if exc.status_code == 401 else 50210, str(exc)) from None
+    return media_proxy_response(request.app.state.player_proxy, remote)
+
+
+def media_proxy_response(manager, remote, check_enabled=False):
+    def available():
+        return not check_enabled or manager.available(remote['generation'])
+
+    if remote['kind'] == 'body':
+        if not available():
+            raise APIError(403, 40301, '播放器代理未开启')
+        return Response(remote['body'], status_code=remote['status'],
+                        headers=remote['headers'], media_type=remote['media_type'])
+    if remote['kind'] == 'head':
+        try:
+            if not available():
+                raise APIError(403, 40301, '播放器代理未开启')
+            return Response(status_code=remote['status'], headers=remote['headers'],
+                            media_type=remote['media_type'])
+        finally:
+            manager.close_result(remote)
+
+    def stream():
+        try:
+            for chunk in remote['response'].iter_content(256 * 1024):
+                if not available():
+                    break
+                if chunk:
+                    yield chunk
+        finally:
+            manager.close_result(remote)
+
+    if not available():
+        manager.close_result(remote)
+        raise APIError(403, 40301, '播放器代理未开启')
+    return StreamingResponse(stream(), status_code=remote['status'],
+                             headers=remote['headers'], media_type=remote['media_type'])
+
+
 class ResourceSyncSiteInput(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     enabled: bool = False
     endpoint_url: str = Field(min_length=1, max_length=2048)
-    auth_type: str = Field('none', max_length=20)
-    header_name: str = Field('X-API-Key', max_length=64)
-    secret: str | None = Field(None, max_length=4096)
+    request_headers: dict[str, str] | None = None
     resolve_media: bool = False
     batch_size: int = Field(50, ge=1, le=100)
     timeout: int = Field(30, ge=5, le=120)
@@ -1091,6 +1700,7 @@ class ResourceSyncExecuteInput(BaseModel):
     site_id: str = Field(min_length=32, max_length=32)
     ids: list[str] = Field(default_factory=list, max_length=10000)
     all: bool = False
+    force: bool = False
 
 
 class ResourceSyncRecordRetryInput(BaseModel):
@@ -1112,8 +1722,8 @@ def resource_sync_site_create(body: ResourceSyncSiteInput, request: Request):
     from resource_sync import SyncError
     try:
         result = request.app.state.resource_sync.create_site(
-            body.name, body.enabled, body.endpoint_url, body.auth_type,
-            body.header_name, body.secret, body.batch_size, body.timeout, body.resolve_media)
+            body.name, body.enabled, body.endpoint_url, body.batch_size, body.timeout,
+            body.resolve_media, body.request_headers)
     except SyncError as exc:
         raise APIError(400, 40006, str(exc))
     return dict(code=0, message='created', data=result)
@@ -1126,8 +1736,8 @@ def resource_sync_site_update(site_id: str, body: ResourceSyncSiteInput, request
         raise APIError(404, 40406, '第三方网站不存在')
     try:
         result = request.app.state.resource_sync.update_site(
-            site_id, body.name, body.enabled, body.endpoint_url, body.auth_type,
-            body.header_name, body.secret, body.batch_size, body.timeout, body.resolve_media)
+            site_id, body.name, body.enabled, body.endpoint_url, body.batch_size, body.timeout,
+            body.resolve_media, body.request_headers)
     except SyncError as exc:
         raise APIError(400, 40006, str(exc))
     return dict(code=0, message='ok', data=result)
@@ -1152,7 +1762,8 @@ def resource_sync_runs(request: Request, limit: int = Query(20, ge=1, le=100),
 def resource_sync_execute(body: ResourceSyncExecuteInput, request: Request):
     from resource_sync import SyncError
     try:
-        result = request.app.state.resource_sync.sync(body.site_id, body.ids, body.all)
+        result = request.app.state.resource_sync.sync(
+            body.site_id, body.ids, body.all, force=body.force)
     except SyncError as exc:
         raise APIError(409, 40906, str(exc))
     return dict(code=0, message='ok', data=result)
@@ -1223,6 +1834,9 @@ class FfmpegSettingsInput(BaseModel):
 
 class FfmpegCompressionSettingsInput(BaseModel):
     enabled: bool
+    compatibility_only: bool = Field(default=True, alias='compatibilityOnly')
+    generate_hover_preview: bool = Field(default=True, alias='generateHoverPreview')
+    generate_vtt_preview: bool = Field(default=True, alias='generateVttPreview')
     min_file_size_mb: float = Field(alias='minFileSizeMb', ge=1, le=102400)
     min_duration_minutes: float = Field(alias='minDurationMinutes', ge=1, le=1440)
     max_video_bitrate_mbps: float = Field(alias='maxVideoBitrateMbps', ge=0.1, le=100)
@@ -1234,6 +1848,17 @@ class FfmpegCompressionSettingsInput(BaseModel):
     hls_segment_seconds: int = Field(alias='hlsSegmentSeconds', ge=1, le=30)
 
 
+class ImageCompressionSettingsInput(BaseModel):
+    enabled: bool
+    min_file_size_mb: float = Field(alias='minFileSizeMb', ge=0.1, le=102400)
+    quality: int = Field(ge=1, le=100)
+
+
+class ChunkCleanupSettingsInput(BaseModel):
+    enabled: bool = True
+    retention_days: int = Field(default=7, alias='retentionDays', ge=1, le=3650)
+
+
 class R2SettingsInput(BaseModel):
     enabled: bool = False
     endpoint_url: str = Field(alias='endpointUrl', max_length=2048)
@@ -1242,12 +1867,19 @@ class R2SettingsInput(BaseModel):
     bucket: str = Field(max_length=255)
     public_base_url: str = Field(default='', alias='publicBaseUrl', max_length=2048)
     path_prefix: str = Field(default='', alias='pathPrefix', max_length=512)
-    concurrency: int = Field(default=1, ge=0, le=16)
-    file_concurrency: int = Field(default=3, alias='fileConcurrency', ge=1, le=16)
+    video_concurrency: int | None = Field(default=None, alias='videoConcurrency', ge=0, le=16)
+    video_file_concurrency: int | None = Field(
+        default=None, alias='videoFileConcurrency', ge=1, le=16)
+    other_concurrency: int | None = Field(default=None, alias='otherConcurrency', ge=0, le=16)
+    other_file_concurrency: int | None = Field(
+        default=None, alias='otherFileConcurrency', ge=1, le=16)
+    # Compatibility for a management page cached before the queue split.
+    concurrency: int | None = Field(default=None, ge=0, le=16)
+    file_concurrency: int | None = Field(default=None, alias='fileConcurrency', ge=1, le=16)
     auto_upload: bool = Field(default=False, alias='autoUpload')
     auto_collection: bool = Field(default=False, alias='autoCollection')
     cleanup_enabled: bool = Field(default=False, alias='cleanupEnabled')
-    retention_days: int = Field(default=7, alias='retentionDays', ge=1, le=3650)
+    retention_days: int = Field(default=7, alias='retentionDays', le=3650)
 
 
 class R2TaskIdsInput(BaseModel):
@@ -1284,13 +1916,17 @@ def r2_task_list(request: Request, page: int = Query(1, ge=1),
                  page_size: int = Query(20, ge=1, le=100),
                  keyword: str | None = Query(None, max_length=255),
                  status: str | None = Query(None),
-                 resource_type: str | None = Query(None)):
+                 resource_type: str | None = Query(None),
+                 sync_group: str | None = Query(None)):
     if status and status not in {'queued', 'running', 'completed', 'failed'}:
         raise APIError(400, 40001, 'R2 同步状态筛选参数无效')
     if resource_type and resource_type not in {'collection', 'upload'}:
         raise APIError(400, 40001, 'R2资源来源筛选参数无效')
+    if sync_group and sync_group not in {'video', 'other'}:
+        raise APIError(400, 40001, 'R2同步分组筛选参数无效')
     result = request.app.state.r2_sync.list_tasks(
-        page, page_size, keyword.strip() if keyword else None, status, resource_type)
+        page, page_size, keyword.strip() if keyword else None,
+        status, resource_type, sync_group)
     return dict(code=0, message='ok', data=result)
 
 
@@ -1326,6 +1962,12 @@ def sync_uploads_to_r2(body: R2TaskIdsInput, request: Request):
     return dict(code=0, message='queued', data=result)
 
 
+@app.post('/api/r2/uploads/cleanup-local', dependencies=[Depends(authorize)])
+def cleanup_uploaded_local_files(body: R2TaskIdsInput, request: Request):
+    result = request.app.state.r2_sync.cleanup_uploaded_local_files(body.ids)
+    return dict(code=0, message='cleaned', data=result)
+
+
 @app.post('/upload/file', dependencies=[Depends(authorize)])
 def upload_file(request: Request, file: UploadFile = File(...),
                 r2_sync_enabled: bool = Form(False, alias='r2SyncEnabled')):
@@ -1336,8 +1978,10 @@ def upload_file(request: Request, file: UploadFile = File(...),
 
 
 @app.get('/upload/chunk', dependencies=[Depends(authorize)])
-def upload_chunk_status(request: Request, identifier: str = Query(..., min_length=1, max_length=128)):
-    result = request.app.state.uploads.check_chunks(identifier)
+def upload_chunk_status(request: Request,
+                        identifier: str = Query(..., min_length=1, max_length=128),
+                        include_chunks: bool = Query(True, alias='includeChunks')):
+    result = request.app.state.uploads.check_chunks(identifier, include_chunks)
     return dict(code=0, message='ok', data=result)
 
 
@@ -1394,7 +2038,11 @@ def ffmpeg_compression_settings(request: Request):
 def update_ffmpeg_compression_settings(
         body: FfmpegCompressionSettingsInput, request: Request):
     result = request.app.state.uploads.set_compression_settings({
-        'enabled': body.enabled, 'minFileSizeMb': body.min_file_size_mb,
+        'enabled': body.enabled,
+        'compatibilityOnly': body.compatibility_only,
+        'generateHoverPreview': body.generate_hover_preview,
+        'generateVttPreview': body.generate_vtt_preview,
+        'minFileSizeMb': body.min_file_size_mb,
         'minDurationMinutes': body.min_duration_minutes,
         'maxVideoBitrateMbps': body.max_video_bitrate_mbps,
         'maxWidth': body.max_width, 'maxHeight': body.max_height,
@@ -1409,6 +2057,43 @@ def update_ffmpeg_compression_settings(
 def reset_ffmpeg_compression_settings(request: Request):
     result = request.app.state.uploads.reset_compression_settings()
     return dict(code=0, message='reset', data=result)
+
+
+@app.get('/api/image/compression-settings', dependencies=[Depends(authorize)])
+def image_compression_settings(request: Request):
+    return dict(
+        code=0, message='ok',
+        data=request.app.state.uploads.image_compression_settings())
+
+
+@app.put('/api/image/compression-settings', dependencies=[Depends(authorize)])
+def update_image_compression_settings(
+        body: ImageCompressionSettingsInput, request: Request):
+    result = request.app.state.uploads.set_image_compression_settings({
+        'enabled': body.enabled,
+        'minFileSizeMb': body.min_file_size_mb,
+        'quality': body.quality,
+    })
+    return dict(code=0, message='saved', data=result)
+
+
+@app.get('/api/upload/chunk-cleanup/settings', dependencies=[Depends(authorize)])
+def chunk_cleanup_settings(request: Request):
+    return dict(code=0, message='ok', data=request.app.state.uploads.chunk_cleanup_settings())
+
+
+@app.put('/api/upload/chunk-cleanup/settings', dependencies=[Depends(authorize)])
+def update_chunk_cleanup_settings(body: ChunkCleanupSettingsInput, request: Request):
+    result = request.app.state.uploads.set_chunk_cleanup_settings({
+        'enabled': body.enabled, 'retentionDays': body.retention_days,
+    })
+    return dict(code=0, message='saved', data=result)
+
+
+@app.post('/api/upload/chunk-cleanup/run', dependencies=[Depends(authorize)])
+def run_chunk_cleanup(request: Request):
+    result = request.app.state.uploads.cleanup_expired_chunks()
+    return dict(code=0, message='cleaned', data=result)
 
 
 @app.post('/api/ffmpeg/tasks/retry', dependencies=[Depends(authorize)])

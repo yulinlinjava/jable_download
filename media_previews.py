@@ -92,7 +92,7 @@ class MediaPreviewGenerator:
         filters.append(''.join(labels) + f'concat=n={len(labels)}:v=1:a=0[outv]')
         command.extend([
             '-filter_complex', ';'.join(filters), '-map', '[outv]', '-an',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+            '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28',
             '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(preview),
         ])
         result = self.run(command)

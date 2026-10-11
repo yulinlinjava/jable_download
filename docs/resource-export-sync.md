@@ -38,14 +38,20 @@ VTT 文件保存为资源目录中的 `preview.vtt`，其引用图片使用 `vtt
 
 ## 同步协议
 
-系统向所选网站的接口发送 `POST application/json` 请求，每批 1–100 条：
+系统向所选网站的接口发送 `POST application/json` 请求，每批 1–100 条。请求体直接是资源数组，不附加 `request_id` 或 `resources` 外层对象：
 
 ```json
-{
-  "request_id": "唯一批次编号",
-  "resources": []
-}
+[
+  {
+    "source": "123av",
+    "id": "demo-001",
+    "title": "示例资源一",
+    "m3u8_url": "https://media.example.com/123/demo-001/index.m3u8"
+  }
+]
 ```
+
+Java 接口可以直接使用 `public String importVideo(@RequestBody List<ExternalVideo> vals)` 接收。
 
 第三方可以只返回 HTTP 2xx，也可以返回逐条结果：
 
@@ -66,7 +72,7 @@ VTT 文件保存为资源目录中的 `preview.vtt`，其引用图片使用 `vtt
 
 `status` 为 `failed` 或 `error` 时，该条记为失败；未返回逐条结果的 HTTP 2xx 请求按整批成功处理。HTTP 4xx 直接失败，连接错误和 HTTP 5xx 最多尝试三次。响应最大读取 1 MB，接口重定向不会自动跟随。
 
-支持无鉴权、Bearer Token 和自定义请求头的 API Key。密钥使用服务本地随机密钥进行 AES-GCM 加密，管理接口只返回是否已配置，不返回明文。加密密钥保存在数据库同目录的 `tasks.sync.key`，备份或迁移数据库时应同时保留该文件。
+同步网站的鉴权和业务参数统一通过“请求头配置”JSON 设置，例如 `{"Authorization":"Bearer token","X-API-Key":"key"}`。每个网站最多可配置 30 项请求头；系统自动发送 `Accept: application/json`，JSON 请求的 `Content-Type` 由 HTTP 客户端生成。请求头使用服务本地随机密钥进行 AES-GCM 加密，管理接口只返回是否已配置，不返回明文。编辑网站时留空表示保留，填写 `{}` 表示清空。旧版鉴权字段不会迁移或继续使用，需要重新编辑旧网站并填写请求头。加密密钥保存在数据库同目录的 `tasks.sync.key`，备份或迁移数据库时应同时保留该文件。
 
 第三方同步接口支持 HTTP/HTTPS、局域网地址、localhost 和自定义端口。运行服务的容器或主机必须能够访问所填写的地址；在 Docker 中填写 `localhost` 时，它指向 API 容器自身。
 
@@ -79,11 +85,11 @@ VTT 文件保存为资源目录中的 `preview.vtt`，其引用图片使用 `vtt
 - API Key 请求头，默认 `X-API-Key`。
 - 节点的 `JABLE_API_KEY`、每批资源数和请求超时。
 
-点击资源管理中的“调度至下载节点”后，本地服务会先对 Jable/123AV 资源重新解析可用的 `m3u8_url`，然后分批向节点发送标准 JSON 数组。这一模式不使用上面的 `request_id/resources` 包装协议，也不新增接收接口。节点直接执行现有导入逻辑：按番号或标题去重，新的远程资源进入待下载队列，再由节点自身的全局调度开关和并发数执行下载。
+点击资源管理中的“调度至下载节点”后，本地服务会先对 Jable/123AV 资源重新解析可用的 `m3u8_url`，然后分批向节点发送标准 JSON 数组。节点直接执行现有导入逻辑：按番号或标题去重，新的远程资源进入待下载队列，再由节点自身的全局调度开关和并发数执行下载。
 
 节点接口的响应会按 `data.results[].index` 匹配每条资源。`created`、`updated` 和 `skipped` 都表示节点成功处理，`failed` 记入失败原因。相同番号在节点中为 `pending` 或 `failed` 时，会用新数据覆盖并清空旧分片后重新排队；`queued`、`downloading` 和 `completed` 状态则跳过覆盖。发送全部资源时会逐条解析并分批请求，资源数量较大时需要较长时间。
 
-“发送记录”Tab 以资源为粒度分页展示发送时间、节点、标题、来源、番号、状态和返回消息。可按标题、番号、节点或来源模糊搜索，也可按节点和状态筛选。删除操作只删除发送历史，不会删除两端资源。多选重试只处理选中的失败记录；全部重试处理所有未解决的失败记录，并按“节点 + 资源”去重。重试成功后旧失败记录保留并标记为“重试成功”，不会被下一次全部重试重复处理。
+“发送记录”Tab 以资源为粒度分页展示最近发送时间、发送次数、节点、标题、来源、番号、当前状态和返回消息。`resource_sync_items` 使用“节点 + 资源番号”唯一键，每个节点上的每个资源始终只有一行；排队、获取资源、发送、成功和失败均更新这行，失败重试也复用原记录 ID。可按标题、番号、节点或来源模糊搜索，也可按节点和状态筛选。删除操作只删除这条当前发送状态，不会删除两端资源；删除后可以重新调度。多选重试只处理选中的失败记录，全部重试处理所有失败记录。
 
 ## API
 
@@ -92,11 +98,11 @@ VTT 文件保存为资源目录中的 `preview.vtt`，其引用图片使用 `vtt
 - `POST /api/resource-sync/sites`，添加第三方网站。
 - `PUT /api/resource-sync/sites/<site_id>`，修改第三方网站；`secret` 为空时保留已配置密钥。
 - `DELETE /api/resource-sync/sites/<site_id>`，删除网站配置，历史同步记录仍保留。
-- `POST /api/resource-sync/execute`，同步选中资源时请求体为 `{"site_id":"网站 ID","ids":["任务 ID"],"all":false}`；同步全部资源时使用 `{"site_id":"网站 ID","ids":[],"all":true}`。
+- `POST /api/resource-sync/execute`，同步选中资源时请求体为 `{"site_id":"网站 ID","ids":["任务 ID"],"all":false,"force":false}`；同步全部资源时使用 `{"site_id":"网站 ID","ids":[],"all":true,"force":false}`。`force=true` 会重新发送已经同步成功的资源；正在同步的资源始终跳过，相同网站和资源复用原状态记录。
 - `GET /api/resource-sync/runs`，查询最近同步记录；可传 `site_id` 筛选目标网站。
 - `POST /api/resource-sync/runs/<run_id>/retry`，使用原目标网站重新同步该记录中的失败资源。
 - `GET /api/resource-sync/records`，分页查询下载节点发送明细；支持 `keyword`、`status` 和 `site_id` 筛选。
 - `POST /api/resource-sync/records/retry`，请求体使用 `{"ids":["记录 ID"],"all":false}` 或 `{"ids":[],"all":true}`。
-- `POST /api/resource-sync/records/delete`，请求体使用 `{"ids":["记录 ID"]}` 批量删除发送历史。
+- `POST /api/resource-sync/records/delete`，请求体使用 `{"ids":["记录 ID"]}` 批量删除当前发送状态。
 
 下载节点复用上述站点配置和执行 API，节点配置使用 `resolve_media: true`。目标端仅需现有的 `POST /api/collection-items/import`，无需部署额外的节点接收接口。

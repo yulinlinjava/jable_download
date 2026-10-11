@@ -4,12 +4,20 @@ services:
     image: jable-downloader:latest
     ports:
       - "8000:8000"
+    cpus: ${CONTAINER_CPUS:-8.0}
     environment:
       JABLE_API_KEY: ${JABLE_API_KEY:-yes@1234}
       PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8000}
       DOWNLOAD_DIR: ${DOWNLOAD_DIR:-/downloads}
+      DATABASE_PATH: ${DATABASE_PATH:-/data/tasks.sqlite3}
+      UPLOAD_FFMPEG_CONCURRENCY: ${UPLOAD_FFMPEG_CONCURRENCY:-1}
+      UPLOAD_COMPRESS_PRESET: ${UPLOAD_COMPRESS_PRESET:-superfast}
+      UPLOAD_COMPATIBILITY_ONLY_COMPRESSION: ${UPLOAD_COMPATIBILITY_ONLY_COMPRESSION:-true}
+      UPLOAD_GENERATE_HOVER_PREVIEW: ${UPLOAD_GENERATE_HOVER_PREVIEW:-true}
+      UPLOAD_GENERATE_VTT_PREVIEW: ${UPLOAD_GENERATE_VTT_PREVIEW:-true}
     volumes:
       - ./downloads:/downloads
+      - jable_api_data:/data
     stop_grace_period: 50s
     restart: unless-stopped
 
@@ -25,3 +33,6 @@ services:
       - ./downloads:/downloads  # 本機 downloads 資料夾 ←→ 容器內 /downloads
     stdin_open: true            # 保持 stdin 開啟（互動模式）
     tty: true
+
+volumes:
+  jable_api_data:

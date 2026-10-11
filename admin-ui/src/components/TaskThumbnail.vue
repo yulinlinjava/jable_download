@@ -13,9 +13,18 @@ const video = ref<HTMLVideoElement>()
 let hls: Hls | undefined
 const source = computed(() => coverFallback.value ? (props.fallbackCover || '') : (props.cover || ''))
 const previewSource = computed(() => previewFallback.value ? (props.fallbackPreview || '') : (props.preview || ''))
-const hlsSource = computed(() => previewFallback.value ? (props.fallbackPreviewHls || '') : (props.previewHls || ''))
+function originalResourceUrl(value: string) {
+  try { return new URL(value, window.location.origin).searchParams.get('url') || value } catch { return value }
+}
+const hlsSource = computed(() => {
+  const explicit = previewFallback.value ? props.fallbackPreviewHls : props.previewHls
+  return explicit || (/\.m3u8(?:\?|$)/i.test(originalResourceUrl(previewSource.value)) ? previewSource.value : '')
+})
 const useHls = computed(() => Boolean(hlsSource.value && !hlsFailed.value))
-const previewIsVideo = computed(() => useHls.value || /\.(mp4|webm)(?:\?|$)/i.test(previewSource.value))
+const previewIsVideo = computed(() => {
+  const value = originalResourceUrl(previewSource.value)
+  return useHls.value || /\.(mp4|webm)(?:\?|$)/i.test(value)
+})
 const hasPreview = computed(() => Boolean(hlsSource.value || previewSource.value))
 watch(() => [props.cover, props.fallbackCover], () => { failed.value = false; coverFallback.value = false })
 watch(() => [props.preview, props.previewHls, props.fallbackPreview, props.fallbackPreviewHls], () => {

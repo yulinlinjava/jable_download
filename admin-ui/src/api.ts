@@ -29,6 +29,7 @@ export interface UploadResult {
   segmented?: boolean; segmentDuration?: number; originalDeleted?: boolean
   processingStage?: string; warnings?: string[]; deduplicated?: boolean
   duration?: number; durationText?: string; width?: number; height?: number
+  isPortrait: boolean; imageFormat?: string
   videoCodec?: string; audioCodec?: string; bitRate?: number
   originalSize?: number; processedSize?: number; compressed?: boolean; compressionRatio?: number
   r2SyncEnabled?: boolean; r2Synced?: boolean; r2SyncStatus?: 'unsynced' | 'syncing' | 'synced'
@@ -45,6 +46,7 @@ export interface UploadRecord {
   previewType: 'video' | 'image' | 'audio' | 'pdf' | 'file'
   segmented?: boolean; segmentDuration?: number; createdAt: number; updatedAt: number
   duration?: number; durationText?: string; width?: number; height?: number
+  isPortrait: boolean; imageFormat?: string
   videoCodec?: string; audioCodec?: string; bitRate?: number
   originalSize?: number; processedSize?: number; compressed?: boolean; compressionRatio?: number
   r2SyncEnabled?: boolean; r2Synced?: boolean; r2SyncStatus?: 'unsynced' | 'syncing' | 'synced'
@@ -69,27 +71,46 @@ export interface FfmpegSettings {
 }
 
 export interface FfmpegCompressionSettings {
-  enabled: boolean; minFileSizeMb: number; minDurationMinutes: number
+  enabled: boolean; compatibilityOnly: boolean
+  generateHoverPreview: boolean; generateVttPreview: boolean
+  minFileSizeMb: number; minDurationMinutes: number
   maxVideoBitrateMbps: number; maxWidth: number; maxHeight: number
   crf: number; preset: string; audioBitrateKbps: number
   hlsSegmentSeconds: number; presets: string[]
 }
 
+export interface ImageCompressionSettings {
+  enabled: boolean; minFileSizeMb: number; quality: number
+}
+
+export interface ChunkCleanupSettings {
+  enabled: boolean; retentionDays: number
+  incompleteCount: number; incompleteBytes: number; expiredCount: number
+  lastCleanupAt: number; lastDeleted: number; lastFreedBytes: number
+}
+
 export interface R2Settings {
   enabled: boolean; endpointUrl: string; accessKeyId: string
   hasSecretAccessKey: boolean; bucket: string; publicBaseUrl: string
-  pathPrefix: string; concurrency: number; maxConcurrency: number
-  fileConcurrency: number; maxFileConcurrency: number
+  pathPrefix: string; maxConcurrency: number; maxFileConcurrency: number
+  videoConcurrency: number; videoFileConcurrency: number
+  otherConcurrency: number; otherFileConcurrency: number
   autoUpload: boolean; autoCollection: boolean; updatedAt?: number
   cleanupEnabled: boolean; retentionDays: number
 }
 
+export interface PlayerProxySettings {
+  enabled: boolean; updatedAt?: number
+}
+
 export interface R2SyncTask {
   id: string; resourceType: 'collection' | 'upload'; resourceId: string
+  syncGroup: 'video' | 'other'
   source?: string; title?: string; uploadIdentifier?: string; fileName: string
   fileType: 'video' | 'image' | 'other'; status: string
   totalFiles: number; syncedFiles: number; totalBytes: number; syncedBytes: number
   progress: number; objectKey?: string; publicUrl?: string
+  retryCount: number; maxAutoRetries: number; nextRetryAt?: number
   message?: string; error?: string; createdAt: number
   startedAt?: number; completedAt?: number; updatedAt: number
 }
@@ -124,6 +145,7 @@ export interface DownloadTask {
   preview_file?: string; preview_url?: string; vtt_file?: string; vtt_url?: string; m3u8_url?: string
   preview_m3u8_file?: string; preview_m3u8_url?: string
   preview5_m3u8_file?: string; preview5_m3u8_url?: string
+  published_at?: string; actors: string[]; tags: string[]
   fallback_m3u8_url?: string; fallback_vtt_url?: string; fallback_cover_url?: string
   chapters?: Array<{ index: number; title: string; duration?: string; status: string
     downloaded_segments: number; total_segments: number; progress: number
@@ -134,38 +156,79 @@ export interface DownloadTask {
 }
 export interface CollectionTask {
   id: string; name: string; url: string; batch_size: number; status: string
+  collection_type: 'webpage' | 'api'; api_source: string
+  request_method: 'GET' | 'POST'; request_headers: Record<string, string>
+  request_body: unknown; request_timeout: number
+  last_updated: number; last_failed: number
   scheduled_enabled: boolean; last_scheduled_date?: string
   r2_sync_enabled: boolean
+  local_collect_enabled: boolean
+  auto_download_enabled: boolean
   node_ids: string[]
+  sync_site_ids: string[]
+  sync_sites: Array<{ id: string; name: string; enabled: boolean; available: boolean }>
   sync_nodes: Array<{ id: string; name: string; enabled: boolean; available: boolean }>
   last_total: number; last_created: number; last_skipped: number; last_task_ids: string[]
   last_node_queued: number; last_node_skipped: number; last_node_failed: number
+  last_download_queued: number; last_download_skipped: number; last_download_failed: number
   last_error?: string; last_run_at?: number; created_at: number; updated_at: number
+}
+export interface SyncSite {
+  id: string; name: string; enabled: boolean; endpoint_url: string; resolve_media?: boolean
+  has_request_headers: boolean
+  batch_size: number; timeout: number; created_at: number; updated_at: number
+}
+export interface CollectorNode {
+  id: string; name: string; token_suffix: string; token?: string | null; enabled: boolean
+  status: 'disabled' | 'unconnected' | 'online' | 'offline'
+  current_jobs: number; success_count: number; failed_count: number
+  online: boolean; last_heartbeat: number; last_error?: string
+  created_at: number; updated_at: number
+}
+export interface CollectorNodeSummary {
+  items: CollectorNode[]; queued: number; leased: number; failed: number
+}
+export interface LocalCollectorConfig {
+  id: string; name: string; server_url: string; has_token: boolean
+  concurrency: number; auto_start: boolean
+  status: 'stopped' | 'running' | 'stopping'
+  current_jobs: Array<{ id: string; kind: 'list' | 'detail'; source: string
+    url: string; started_at: number }>
+  success_count: number; failed_count: number; last_error?: string
+  last_started_at?: number; last_stopped_at?: number
+  created_at: number; updated_at: number
 }
 export interface CollectionItem {
   id: string; collection_id?: string; source: string; video_id: string; title?: string
   url: string; cover?: string; preview_image?: string; preview_m3u8?: string
   preview5_m3u8?: string; duration?: string
+  published_at?: string; actors: string[]; tags: string[]
   kind: 'collection' | 'download'; status: string; r2_synced: boolean
+  can_play?: boolean
   r2_sync_status: 'unsynced' | 'syncing' | 'synced'; download_task_id?: string
   r2_synced_at?: number; local_deleted: boolean; local_deleted_at?: number
   synced_nodes: Array<{ node_id: string; node_name: string
     status: 'queued' | 'sending' | 'completed' | 'failed'; sent_at?: number; message?: string }>
   download?: DownloadTask; first_seen: number; last_seen: number
 }
-export interface NodeQueueSummary {
-  queued: number; processing: number; succeeded: number; failed: number
-}
 export interface SchedulerSettings {
   enabled: boolean; concurrency: number; segment_concurrency: number
-  running: number; scheduled: number
+  running: number; scheduled: number; collection_running?: number
   completed: number; failed: number; total: number
-  download_speed: number; upload_speed: number; updated_at: number
+  download_speed: number; upload_speed: number
+  video_upload_speed: number; other_upload_speed: number; updated_at: number
 }
 
 export interface PublicUrlSettings {
   url: string; source: 'dynamic' | 'environment' | 'default'
   updated_at?: number; environment_url: string; default_url: string
+}
+
+export interface DatabaseSettings {
+  activePath: string; activeSize: number
+  backupPath: string; backupExists: boolean; backupSize: number
+  lastBackupAt?: number; separateStorage: boolean
+  copiedKeys?: string[]; integrity?: string
 }
 
 export interface ImportScript {
@@ -176,4 +239,5 @@ export interface ImportScript {
 export interface DownloadSigner {
   id: string; name: string; source: string; enabled: boolean; code: string
   config: Record<string, unknown>; created_at: number; updated_at: number
+  image_base_url: string; video_base_url: string; format_code: string
 }

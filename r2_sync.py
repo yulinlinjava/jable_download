@@ -26,6 +26,7 @@ class R2SyncError(Exception):
 class R2SyncManager:
     MAX_CONCURRENCY = 16
     MAX_FILE_CONCURRENCY = 16
+    AUTO_RETRY_DELAYS = (60, 300, 900, 1800)
 
     def __init__(self, download_root, database):
         self.database = Path(database).resolve()
@@ -36,10 +37,22 @@ class R2SyncManager:
         self._wake = threading.Event()
         self._backfill_wake = threading.Event()
         self._cleanup_wake = threading.Event()
-        self._futures = {}
+        self._preview_guard = threading.RLock()
+        self._preview_config = None
+        self._preview_client = None
+        self._preview_signature = None
+        self._futures = {'video': {}, 'other': {}}
         self.speed_meter = SpeedMeter(window_seconds=5.0)
-        self._executor = ThreadPoolExecutor(
-            max_workers=self.MAX_CONCURRENCY, thread_name_prefix='r2-sync')
+        self.group_speed_meters = {
+            'video': SpeedMeter(window_seconds=5.0),
+            'other': SpeedMeter(window_seconds=5.0),
+        }
+        self._executors = {
+            'video': ThreadPoolExecutor(
+                max_workers=self.MAX_CONCURRENCY, thread_name_prefix='r2-video'),
+            'other': ThreadPoolExecutor(
+                max_workers=self.MAX_CONCURRENCY, thread_name_prefix='r2-other'),
+        }
         with self.db() as db:
             db.execute('PRAGMA journal_mode=WAL')
             db.execute('PRAGMA synchronous=NORMAL')
@@ -50,6 +63,10 @@ class R2SyncManager:
                   bucket TEXT, public_base_url TEXT, path_prefix TEXT,
                   concurrency INTEGER NOT NULL DEFAULT 1,
                   file_concurrency INTEGER NOT NULL DEFAULT 3,
+                  video_concurrency INTEGER NOT NULL DEFAULT 1,
+                  video_file_concurrency INTEGER NOT NULL DEFAULT 3,
+                  other_concurrency INTEGER NOT NULL DEFAULT 3,
+                  other_file_concurrency INTEGER NOT NULL DEFAULT 3,
                   auto_upload INTEGER NOT NULL DEFAULT 0,
                   auto_collection INTEGER NOT NULL DEFAULT 0,
                   cleanup_enabled INTEGER NOT NULL DEFAULT 0,
@@ -58,13 +75,14 @@ class R2SyncManager:
                 CREATE TABLE IF NOT EXISTS r2_sync_tasks (
                   id TEXT PRIMARY KEY, upload_identifier TEXT NOT NULL UNIQUE,
                   resource_type TEXT NOT NULL DEFAULT 'upload', resource_id TEXT,
-                  source TEXT, title TEXT,
+                  source TEXT, title TEXT, sync_group TEXT NOT NULL DEFAULT 'other',
                   file_name TEXT, file_type TEXT, status TEXT NOT NULL DEFAULT 'queued',
                   total_files INTEGER NOT NULL DEFAULT 0,
                   synced_files INTEGER NOT NULL DEFAULT 0,
                   total_bytes INTEGER NOT NULL DEFAULT 0,
                   synced_bytes INTEGER NOT NULL DEFAULT 0,
                   object_key TEXT, public_url TEXT, message TEXT, error TEXT,
+                  retry_count INTEGER NOT NULL DEFAULT 0, next_retry_at REAL,
                   created REAL NOT NULL, started REAL, completed REAL, updated REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS r2_sync_tasks_status_created
                   ON r2_sync_tasks(status,created,id);
@@ -81,8 +99,13 @@ class R2SyncManager:
             now = time.time()
             setting_columns = {row['name'] for row in db.execute(
                 'PRAGMA table_info(r2_settings)').fetchall()}
+            had_video_settings = 'video_concurrency' in setting_columns
             for name, definition in (
                     ('file_concurrency', 'INTEGER NOT NULL DEFAULT 3'),
+                    ('video_concurrency', 'INTEGER NOT NULL DEFAULT 1'),
+                    ('video_file_concurrency', 'INTEGER NOT NULL DEFAULT 3'),
+                    ('other_concurrency', 'INTEGER NOT NULL DEFAULT 3'),
+                    ('other_file_concurrency', 'INTEGER NOT NULL DEFAULT 3'),
                     ('auto_upload', 'INTEGER NOT NULL DEFAULT 0'),
                     ('auto_collection', 'INTEGER NOT NULL DEFAULT 0'),
                     ('cleanup_enabled', 'INTEGER NOT NULL DEFAULT 0'),
@@ -93,12 +116,26 @@ class R2SyncManager:
                 'PRAGMA table_info(r2_sync_tasks)').fetchall()}
             for name, definition in (
                     ('resource_type', "TEXT NOT NULL DEFAULT 'upload'"),
-                    ('resource_id', 'TEXT'), ('source', 'TEXT'), ('title', 'TEXT')):
+                    ('resource_id', 'TEXT'), ('source', 'TEXT'), ('title', 'TEXT'),
+                    ('sync_group', "TEXT NOT NULL DEFAULT 'other'"),
+                    ('retry_count', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('next_retry_at', 'REAL')):
                 if name not in task_columns:
                     db.execute(f'ALTER TABLE r2_sync_tasks ADD COLUMN {name} {definition}')
+            if not had_video_settings:
+                db.execute('''UPDATE r2_settings SET
+                              video_concurrency=coalesce(concurrency,1),
+                              video_file_concurrency=coalesce(file_concurrency,3)''')
             db.execute("""UPDATE r2_sync_tasks SET resource_type='upload',
                           resource_id=upload_identifier
                           WHERE resource_id IS NULL OR resource_id=''""")
+            db.execute("""UPDATE r2_sync_tasks SET sync_group=CASE
+                          WHEN resource_type='collection' OR lower(file_type)='video'
+                          THEN 'video' ELSE 'other' END""")
+            db.execute('''CREATE INDEX IF NOT EXISTS r2_sync_tasks_group_status_created
+                          ON r2_sync_tasks(sync_group,status,created,id)''')
+            db.execute('''CREATE INDEX IF NOT EXISTS r2_sync_tasks_retry_schedule
+                          ON r2_sync_tasks(sync_group,status,next_retry_at,created,id)''')
             db.execute('''CREATE UNIQUE INDEX IF NOT EXISTS r2_sync_resource_unique
                           ON r2_sync_tasks(resource_type,resource_id)''')
             # Versions before generic resource synchronization stored paths
@@ -110,8 +147,10 @@ class R2SyncManager:
             db.execute('''INSERT OR IGNORE INTO r2_settings
                 (id,enabled,endpoint_url,access_key_id,secret_access_key,bucket,
                  public_base_url,path_prefix,concurrency,file_concurrency,
+                 video_concurrency,video_file_concurrency,
+                 other_concurrency,other_file_concurrency,
                  auto_upload,auto_collection,cleanup_enabled,retention_days,created,updated)
-                VALUES(1,0,'','','','','','',1,3,0,0,0,7,?,?)''', (now, now))
+                VALUES(1,0,'','','','','','',1,3,1,3,3,3,0,0,0,7,?,?)''', (now, now))
             db.execute("""UPDATE r2_sync_tasks SET status='queued',started=NULL,
                           message='服务重启，任务已重新排队',updated=?
                           WHERE status='running'""", (now,))
@@ -165,6 +204,7 @@ class R2SyncManager:
                                       WHERE r.resource_type='upload' AND r.resource_id=uploads.identifier
                                       AND r.status='completed' ORDER BY r.completed DESC LIMIT 1))
                                       WHERE r2_synced=1""")
+        self._set_preview_config(self.settings(include_secret=True))
         self._dispatcher = threading.Thread(
             target=self._dispatch_loop, name='r2-sync-dispatch', daemon=True)
         self._backfill = threading.Thread(
@@ -199,10 +239,18 @@ class R2SyncManager:
             self._backfill.join(timeout=3)
         if self._cleanup.is_alive():
             self._cleanup.join(timeout=3)
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for executor in self._executors.values():
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def upload_speed(self):
         return self.speed_meter.speed()
+
+    def upload_speeds(self):
+        return {
+            'total': self.speed_meter.speed(),
+            'video': self.group_speed_meters['video'].speed(),
+            'other': self.group_speed_meters['other'].speed(),
+        }
 
     def request_backfill(self):
         self._backfill_wake.set()
@@ -273,22 +321,44 @@ class R2SyncManager:
         if values.get('cleanup_enabled') and not public_url:
             raise R2SyncError('启用本地文件自动清理前，请配置 R2 公开地址')
         try:
-            concurrency = int(values.get('concurrency', 1))
-            file_concurrency = int(values.get('file_concurrency', 3))
+            legacy_concurrency = values.get('concurrency')
+            legacy_file_concurrency = values.get('file_concurrency')
+            video_value = values.get('video_concurrency')
+            video_file_value = values.get('video_file_concurrency')
+            other_value = values.get('other_concurrency')
+            other_file_value = values.get('other_file_concurrency')
+            video_concurrency = int(video_value if video_value is not None else
+                                    legacy_concurrency if legacy_concurrency is not None else 1)
+            video_file_concurrency = int(
+                video_file_value if video_file_value is not None else
+                legacy_file_concurrency if legacy_file_concurrency is not None else 3)
+            other_concurrency = int(other_value if other_value is not None else 3)
+            other_file_concurrency = int(
+                other_file_value if other_file_value is not None else 3)
             retention_days = int(values.get('retention_days', 7))
         except (TypeError, ValueError):
             raise R2SyncError('同步并发数格式无效') from None
-        if concurrency < 0 or concurrency > cls.MAX_CONCURRENCY:
-            raise R2SyncError(f'同步并发数必须为 0—{cls.MAX_CONCURRENCY}')
-        if file_concurrency < 1 or file_concurrency > cls.MAX_FILE_CONCURRENCY:
-            raise R2SyncError(f'单资源文件并发数必须为 1—{cls.MAX_FILE_CONCURRENCY}')
-        if retention_days < 1 or retention_days > 3650:
-            raise R2SyncError('本地文件保留天数必须为 1—3650 天')
+        for label, concurrency in (
+                ('视频同步任务并发数', video_concurrency),
+                ('其他同步任务并发数', other_concurrency)):
+            if concurrency < 0 or concurrency > cls.MAX_CONCURRENCY:
+                raise R2SyncError(f'{label}必须为 0—{cls.MAX_CONCURRENCY}')
+        for label, concurrency in (
+                ('单视频资源文件并发数', video_file_concurrency),
+                ('单普通资源文件并发数', other_file_concurrency)):
+            if concurrency < 1 or concurrency > cls.MAX_FILE_CONCURRENCY:
+                raise R2SyncError(f'{label}必须为 1—{cls.MAX_FILE_CONCURRENCY}')
+        if retention_days > 3650:
+            raise R2SyncError('本地文件保留天数不能超过 3650 天')
+        retention_days = max(0, retention_days)
         return dict(enabled=bool(values.get('enabled')), endpoint_url=endpoint,
                     access_key_id=access_key, secret_access_key=secret,
                     bucket=bucket, public_base_url=public_url,
-                    path_prefix=prefix, concurrency=concurrency,
-                    file_concurrency=file_concurrency,
+                    path_prefix=prefix,
+                    video_concurrency=video_concurrency,
+                    video_file_concurrency=video_file_concurrency,
+                    other_concurrency=other_concurrency,
+                    other_file_concurrency=other_file_concurrency,
                     auto_upload=bool(values.get('auto_upload')),
                     auto_collection=bool(values.get('auto_collection')),
                     cleanup_enabled=bool(values.get('cleanup_enabled')),
@@ -300,12 +370,19 @@ class R2SyncManager:
                     accessKeyId=row['access_key_id'] or '',
                     hasSecretAccessKey=bool(row['secret_access_key']),
                     bucket=row['bucket'] or '', publicBaseUrl=row['public_base_url'] or '',
-                    pathPrefix=row['path_prefix'] or '', concurrency=int(row['concurrency'] or 0),
-                    fileConcurrency=int(row['file_concurrency'] or 3),
+                    pathPrefix=row['path_prefix'] or '',
+                    videoConcurrency=int(row['video_concurrency'] or 0),
+                    videoFileConcurrency=int(row['video_file_concurrency'] or 3),
+                    otherConcurrency=int(row['other_concurrency'] or 0),
+                    otherFileConcurrency=int(row['other_file_concurrency'] or 3),
+                    # Keep the old fields readable for older management pages.
+                    concurrency=int(row['video_concurrency'] or 0),
+                    fileConcurrency=int(row['video_file_concurrency'] or 3),
                     autoUpload=bool(row['auto_upload']),
                     autoCollection=bool(row['auto_collection']),
                     cleanupEnabled=bool(row['cleanup_enabled']),
-                    retentionDays=int(row['retention_days'] or 7),
+                    retentionDays=max(0, int(row['retention_days']
+                                             if row['retention_days'] is not None else 7)),
                     maxConcurrency=R2SyncManager.MAX_CONCURRENCY,
                     maxFileConcurrency=R2SyncManager.MAX_FILE_CONCURRENCY,
                     updatedAt=row['updated'])
@@ -327,8 +404,23 @@ class R2SyncManager:
             'access_key_id': values.get('access_key_id'),
             'secret_access_key': values.get('secret_access_key') or current.get('secret_access_key'),
             'bucket': values.get('bucket'), 'public_base_url': values.get('public_base_url'),
-            'path_prefix': values.get('path_prefix'), 'concurrency': values.get('concurrency'),
-            'file_concurrency': values.get('file_concurrency', 3),
+            'path_prefix': values.get('path_prefix'),
+            'video_concurrency': (values.get('video_concurrency')
+                                  if values.get('video_concurrency') is not None
+                                  else values.get('concurrency')
+                                  if values.get('concurrency') is not None
+                                  else current.get('video_concurrency')),
+            'video_file_concurrency': (values.get('video_file_concurrency')
+                                       if values.get('video_file_concurrency') is not None
+                                       else values.get('file_concurrency')
+                                       if values.get('file_concurrency') is not None
+                                       else current.get('video_file_concurrency')),
+            'other_concurrency': (values.get('other_concurrency')
+                                  if values.get('other_concurrency') is not None
+                                  else current.get('other_concurrency', 3)),
+            'other_file_concurrency': (values.get('other_file_concurrency')
+                                       if values.get('other_file_concurrency') is not None
+                                       else current.get('other_file_concurrency', 3)),
             'auto_upload': values.get('auto_upload', False),
             'auto_collection': values.get('auto_collection', False),
             'cleanup_enabled': values.get('cleanup_enabled', False),
@@ -339,18 +431,24 @@ class R2SyncManager:
         with self.db() as db:
             db.execute('''UPDATE r2_settings SET enabled=?,endpoint_url=?,access_key_id=?,
                           secret_access_key=?,bucket=?,public_base_url=?,path_prefix=?,
-                          concurrency=?,file_concurrency=?,auto_upload=?,auto_collection=?,
+                          concurrency=?,file_concurrency=?,
+                          video_concurrency=?,video_file_concurrency=?,
+                          other_concurrency=?,other_file_concurrency=?,
+                          auto_upload=?,auto_collection=?,
                           cleanup_enabled=?,retention_days=?,
                           updated=? WHERE id=1''',
                        (1 if validated['enabled'] else 0, validated['endpoint_url'],
                         validated['access_key_id'], self._encrypt(validated['secret_access_key']),
                         validated['bucket'], validated['public_base_url'],
-                        validated['path_prefix'], validated['concurrency'],
-                        validated['file_concurrency'],
+                        validated['path_prefix'], validated['video_concurrency'],
+                        validated['video_file_concurrency'],
+                        validated['video_concurrency'], validated['video_file_concurrency'],
+                        validated['other_concurrency'], validated['other_file_concurrency'],
                         1 if validated['auto_upload'] else 0,
                         1 if validated['auto_collection'] else 0,
                         1 if validated['cleanup_enabled'] else 0,
                         validated['retention_days'], now))
+        self._set_preview_config(validated)
         self._wake.set()
         self._backfill_wake.set()
         self._cleanup_wake.set()
@@ -371,6 +469,71 @@ class R2SyncManager:
                 signature_version='s3v4', connect_timeout=15, read_timeout=120,
                 retries={'max_attempts': 3, 'mode': 'standard'}))
 
+    def _set_preview_config(self, config):
+        cached = dict(config or {})
+        signature = tuple(cached.get(name) for name in (
+            'endpoint_url', 'access_key_id', 'secret_access_key', 'bucket'))
+        with self._preview_guard:
+            if signature != self._preview_signature:
+                self._preview_client = None
+                self._preview_signature = signature
+            self._preview_config = cached
+
+    def open_preview_object(self, relative_path, range_header=None, head=False):
+        """Open an upload asset from R2 without consulting resource/task tables."""
+        relative = str(relative_path or '').replace('\\', '/').lstrip('/')
+        if not relative or any(part in ('', '.', '..') for part in relative.split('/')):
+            raise FileNotFoundError(relative)
+        if range_header and not re.fullmatch(r'bytes=(?:\d+-\d*|-\d+)', range_header.strip()):
+            raise ValueError('Range 请求格式无效')
+        with self._preview_guard:
+            config = dict(self._preview_config or {})
+            if not all(config.get(name) for name in (
+                    'endpoint_url', 'access_key_id', 'secret_access_key', 'bucket')):
+                raise FileNotFoundError(relative)
+            if self._preview_client is None:
+                self._preview_client = self._client(config)
+            client = self._preview_client
+        key = self._object_key(config, relative)
+        try:
+            if head and not range_header:
+                result = client.head_object(Bucket=config['bucket'], Key=key)
+            else:
+                arguments = {'Bucket': config['bucket'], 'Key': key}
+                if range_header:
+                    arguments['Range'] = range_header.strip()
+                result = client.get_object(**arguments)
+        except Exception as exc:
+            try:
+                from botocore.exceptions import ClientError
+                response = exc.response if isinstance(exc, ClientError) else {}
+                status = int(response.get('ResponseMetadata', {}).get('HTTPStatusCode') or 0)
+                code = str(response.get('Error', {}).get('Code') or '')
+            except (ImportError, TypeError, ValueError):
+                status, code = 0, ''
+            if status == 416 or code == 'InvalidRange':
+                raise ValueError('请求范围超出文件大小') from exc
+            if status in (403, 404) or code in ('NoSuchKey', 'NoSuchObject', 'AccessDenied'):
+                raise FileNotFoundError(key) from exc
+            raise
+        headers = {'Accept-Ranges': 'bytes'}
+        mappings = (
+            ('ContentLength', 'Content-Length'), ('ContentRange', 'Content-Range'),
+            ('ETag', 'ETag'), ('CacheControl', 'Cache-Control'),
+            ('ContentDisposition', 'Content-Disposition'),
+        )
+        for source, target in mappings:
+            if result.get(source) is not None:
+                headers[target] = str(result[source])
+        media_type = result.get('ContentType') or self._content_type(Path(relative))
+        return {
+            'body': result.get('Body'),
+            'status': 206 if result.get('ContentRange') else 200,
+            'headers': headers,
+            'media_type': media_type,
+            'object_key': key,
+        }
+
     def test_settings(self, values):
         current = self.settings(include_secret=True)
         candidate = {
@@ -379,8 +542,23 @@ class R2SyncManager:
             'access_key_id': values.get('access_key_id'),
             'secret_access_key': values.get('secret_access_key') or current.get('secret_access_key'),
             'bucket': values.get('bucket'), 'public_base_url': values.get('public_base_url'),
-            'path_prefix': values.get('path_prefix'), 'concurrency': values.get('concurrency', 1),
-            'file_concurrency': values.get('file_concurrency', 3),
+            'path_prefix': values.get('path_prefix'),
+            'video_concurrency': (values.get('video_concurrency')
+                                  if values.get('video_concurrency') is not None
+                                  else values.get('concurrency')
+                                  if values.get('concurrency') is not None
+                                  else current.get('video_concurrency')),
+            'video_file_concurrency': (values.get('video_file_concurrency')
+                                       if values.get('video_file_concurrency') is not None
+                                       else values.get('file_concurrency')
+                                       if values.get('file_concurrency') is not None
+                                       else current.get('video_file_concurrency')),
+            'other_concurrency': (values.get('other_concurrency')
+                                  if values.get('other_concurrency') is not None
+                                  else current.get('other_concurrency', 3)),
+            'other_file_concurrency': (values.get('other_file_concurrency')
+                                       if values.get('other_file_concurrency') is not None
+                                       else current.get('other_file_concurrency', 3)),
             'auto_upload': values.get('auto_upload', False),
             'auto_collection': values.get('auto_collection', False),
             'cleanup_enabled': values.get('cleanup_enabled', False),
@@ -388,7 +566,8 @@ class R2SyncManager:
         }
         config = self._validate(candidate, require_secret=True)
         try:
-            self._client(config).head_bucket(Bucket=config['bucket'])
+            client = self._client(config)
+            client.head_bucket(Bucket=config['bucket'])
         except Exception as exc:
             raise R2SyncError('R2 连接测试失败：' + str(exc)[:300]) from exc
         return {'connected': True, 'bucket': config['bucket']}
@@ -478,6 +657,9 @@ class R2SyncManager:
         config = self._require_enabled()
         resource_type = descriptor['resource_type']
         resource_id = str(descriptor['resource_id'])
+        sync_group = ('video' if resource_type == 'collection'
+                      or str(descriptor.get('file_type') or '').lower() == 'video'
+                      else 'other')
         sync_key = f'{resource_type}:{resource_id}'
         now = time.time()
         total_bytes = sum(path.stat().st_size for path, _ in files)
@@ -486,9 +668,12 @@ class R2SyncManager:
                       if config.get('public_base_url') else None)
         with self.db() as db:
             existing = db.execute(
-                'SELECT id,status,completed FROM r2_sync_tasks WHERE resource_type=? AND resource_id=?',
+                '''SELECT id,status,completed,object_key FROM r2_sync_tasks
+                   WHERE resource_type=? AND resource_id=?''',
                 (resource_type, resource_id)).fetchone()
-            if existing and existing['status'] in ('queued', 'running', 'completed'):
+            same_destination = bool(existing and existing['object_key'] == primary_key)
+            if existing and (existing['status'] == 'running' or
+                             same_destination and existing['status'] in ('queued', 'completed')):
                 self._set_resource_status(
                     db, resource_type, resource_id,
                     'synced' if existing['status'] == 'completed' else 'syncing',
@@ -498,21 +683,24 @@ class R2SyncManager:
             task_id = existing['id'] if existing else uuid.uuid4().hex
             db.execute('''INSERT INTO r2_sync_tasks(
                           id,upload_identifier,resource_type,resource_id,source,title,
-                          file_name,file_type,status,total_files,
+                          sync_group,file_name,file_type,status,total_files,
                           synced_files,total_bytes,synced_bytes,object_key,public_url,
                           message,error,created,started,completed,updated)
-                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                           ON CONFLICT(id) DO UPDATE SET file_name=excluded.file_name,
                           resource_type=excluded.resource_type,resource_id=excluded.resource_id,
                           source=excluded.source,title=excluded.title,
+                          sync_group=excluded.sync_group,
                           file_type=excluded.file_type,status='queued',
                           total_files=excluded.total_files,synced_files=0,
                           total_bytes=excluded.total_bytes,synced_bytes=0,
                           object_key=excluded.object_key,public_url=excluded.public_url,
                           message='等待同步',error=NULL,started=NULL,completed=NULL,
+                          retry_count=0,next_retry_at=NULL,
                           updated=excluded.updated''',
                        (task_id, sync_key, resource_type, resource_id,
                         descriptor.get('source'), descriptor.get('title'),
+                        sync_group,
                         descriptor.get('file_name'), descriptor.get('file_type'),
                         'queued', len(files), 0, total_bytes, 0, primary_key, public_url,
                         '等待同步', None, now, None, None, now))
@@ -687,52 +875,94 @@ class R2SyncManager:
                 break
             parent = parent.parent
 
+    def _cleanup_local_resource(self, resource_type, resource_id):
+        with self.db() as db:
+            if resource_type == 'upload':
+                row = db.execute(
+                    """SELECT identifier,path,hls_path,file_type FROM uploads
+                       WHERE identifier=? AND completed=1 AND r2_sync_status='synced'
+                       AND r2_synced_at IS NOT NULL AND local_deleted=0""",
+                    (resource_id,)).fetchone()
+                key, table = 'identifier', 'uploads'
+            else:
+                row = db.execute(
+                    """SELECT id,source,video_id FROM tasks
+                       WHERE id=? AND status='completed' AND r2_sync_status='synced'
+                       AND r2_synced_at IS NOT NULL AND local_deleted=0""",
+                    (resource_id,)).fetchone()
+                key, table = 'id', 'tasks'
+        if not row:
+            return False
+        try:
+            if resource_type == 'upload':
+                self._remove_upload_files(dict(row))
+            else:
+                self._remove_download_files(dict(row))
+            now = time.time()
+            with self.db() as db:
+                cursor = db.execute(
+                    f"""UPDATE {table} SET local_deleted=1,local_deleted_at=?
+                        WHERE {key}=? AND r2_sync_status='synced' AND local_deleted=0""",
+                    (now, resource_id))
+            return bool(cursor.rowcount)
+        except (OSError, R2SyncError):
+            return False
+
     def cleanup_local_files(self):
         config = self.settings()
         if not config.get('enabled') or not config.get('cleanupEnabled'):
             return {'deleted': 0}
-        cutoff = time.time() - int(config.get('retentionDays') or 7) * 86400
+        retention_days = config.get('retentionDays')
+        retention_days = 7 if retention_days is None else max(0, int(retention_days))
+        cutoff = time.time() - retention_days * 86400
         candidates = []
         with self.db() as db:
             tables = {row['name'] for row in db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             if 'tasks' in tables and {'r2_synced_at', 'local_deleted'} <= self._table_columns(db, 'tasks'):
-                candidates.extend(('collection', dict(row)) for row in db.execute(
+                candidates.extend(('collection', row['id']) for row in db.execute(
                     """SELECT id,source,video_id FROM tasks WHERE status='completed'
                        AND r2_sync_status='synced' AND r2_synced_at IS NOT NULL
                        AND r2_synced_at<=? AND local_deleted=0 ORDER BY r2_synced_at LIMIT 100""",
                     (cutoff,)).fetchall())
             if 'uploads' in tables and {'r2_synced_at', 'local_deleted'} <= self._table_columns(db, 'uploads'):
-                candidates.extend(('upload', dict(row)) for row in db.execute(
+                candidates.extend(('upload', row['identifier']) for row in db.execute(
                     """SELECT identifier,path,hls_path,file_type FROM uploads WHERE completed=1
                        AND r2_sync_status='synced' AND r2_synced_at IS NOT NULL
                        AND r2_synced_at<=? AND local_deleted=0 ORDER BY r2_synced_at LIMIT 100""",
                     (cutoff,)).fetchall())
         deleted = 0
-        for resource_type, row in candidates:
+        for resource_type, resource_id in candidates:
             if self._closed.is_set():
                 break
-            try:
-                if resource_type == 'upload':
-                    self._remove_upload_files(row)
-                    key, value = 'identifier', row['identifier']
-                    table = 'uploads'
-                else:
-                    self._remove_download_files(row)
-                    key, value = 'id', row['id']
-                    table = 'tasks'
-                now = time.time()
-                with self.db() as db:
-                    cursor = db.execute(
-                        f"""UPDATE {table} SET local_deleted=1,local_deleted_at=?
-                            WHERE {key}=? AND r2_sync_status='synced' AND local_deleted=0""",
-                        (now, value))
-                deleted += max(0, cursor.rowcount)
-            except (OSError, R2SyncError):
-                continue
+            deleted += int(self._cleanup_local_resource(resource_type, resource_id))
         if len(candidates) >= 100:
             self._cleanup_wake.set()
         return {'deleted': deleted}
+
+    def cleanup_uploaded_local_files(self, resource_ids):
+        """Delete local upload files after R2 synchronization, keeping all records."""
+        deleted, skipped, failed = [], [], []
+        for resource_id in dict.fromkeys(str(value).strip() for value in resource_ids):
+            if not resource_id:
+                skipped.append(resource_id)
+                continue
+            try:
+                with self.db() as db:
+                    row = db.execute(
+                        """SELECT completed,r2_sync_status,local_deleted FROM uploads
+                           WHERE identifier=?""", (resource_id,)).fetchone()
+                if (not row or not row['completed'] or row['r2_sync_status'] != 'synced'
+                        or row['local_deleted']):
+                    skipped.append(resource_id)
+                    continue
+                if self._cleanup_local_resource('upload', resource_id):
+                    deleted.append(resource_id)
+                else:
+                    failed.append(resource_id)
+            except (OSError, R2SyncError, sqlite3.Error):
+                failed.append(resource_id)
+        return {'deleted': deleted, 'skipped': skipped, 'failed': failed}
 
     def _backfill_type(self, resource_type):
         cursor = ''
@@ -776,34 +1006,47 @@ class R2SyncManager:
         config = self.settings(include_secret=True)
         if not config.get('enabled'):
             return
-        concurrency = max(0, min(self.MAX_CONCURRENCY, int(config.get('concurrency') or 0)))
-        if not concurrency:
-            return
         with self._guard:
-            running = {task_id for task_id, future in self._futures.items()
-                       if not future.done()}
-            available = concurrency - len(running)
-            if available <= 0:
-                return
-            with self.db() as db:
-                rows = db.execute("""SELECT id FROM r2_sync_tasks WHERE status='queued'
-                                   ORDER BY created,id LIMIT ?""", (available,)).fetchall()
-                claimed = []
-                for row in rows:
-                    cursor = db.execute("""UPDATE r2_sync_tasks SET status='running',
-                                           message='正在同步',error=NULL,started=coalesce(started,?),
-                                           updated=? WHERE id=? AND status='queued'""",
-                                        (time.time(), time.time(), row['id']))
-                    if cursor.rowcount:
-                        claimed.append(row['id'])
-            for task_id in claimed:
-                future = self._executor.submit(self._run, task_id)
-                self._futures[task_id] = future
-                future.add_done_callback(lambda _future, current=task_id: self._done(current))
+            for sync_group, setting_key in (
+                    ('video', 'video_concurrency'), ('other', 'other_concurrency')):
+                concurrency = max(0, min(
+                    self.MAX_CONCURRENCY, int(config.get(setting_key) or 0)))
+                if not concurrency:
+                    continue
+                futures = self._futures[sync_group]
+                running = {task_id for task_id, future in futures.items()
+                           if not future.done()}
+                available = concurrency - len(running)
+                if available <= 0:
+                    continue
+                with self.db() as db:
+                    now = time.time()
+                    rows = db.execute("""SELECT id FROM r2_sync_tasks
+                                       WHERE status='queued' AND sync_group=?
+                                       AND (next_retry_at IS NULL OR next_retry_at<=?)
+                                       ORDER BY created,id LIMIT ?""",
+                                      (sync_group, now, available)).fetchall()
+                    claimed = []
+                    for row in rows:
+                        now = time.time()
+                        cursor = db.execute("""UPDATE r2_sync_tasks SET status='running',
+                                               message='正在同步',error=NULL,
+                                               started=coalesce(started,?),next_retry_at=NULL,
+                                               updated=? WHERE id=? AND status='queued'
+                                               AND (next_retry_at IS NULL OR next_retry_at<=?)""",
+                                            (now, now, row['id'], now))
+                        if cursor.rowcount:
+                            claimed.append(row['id'])
+                for task_id in claimed:
+                    future = self._executors[sync_group].submit(self._run, task_id)
+                    futures[task_id] = future
+                    future.add_done_callback(
+                        lambda _future, group=sync_group, current=task_id:
+                        self._done(group, current))
 
-    def _done(self, task_id):
+    def _done(self, sync_group, task_id):
         with self._guard:
-            self._futures.pop(task_id, None)
+            self._futures[sync_group].pop(task_id, None)
         self._wake.set()
 
     @staticmethod
@@ -812,6 +1055,51 @@ class R2SyncManager:
                    '.vtt': 'text/vtt'}
         return special.get(path.suffix.lower()) or mimetypes.guess_type(path.name)[0] \
             or 'application/octet-stream'
+
+    @staticmethod
+    def _is_retryable_error(exc):
+        """Only retry transient transport/service failures, not bad config or local data."""
+        if isinstance(exc, R2SyncError):
+            return False
+        try:
+            from botocore.exceptions import (
+                ClientError, ConnectTimeoutError, ConnectionClosedError,
+                EndpointConnectionError, HTTPClientError, ReadTimeoutError,
+            )
+            if isinstance(exc, (ConnectTimeoutError, ConnectionClosedError,
+                                EndpointConnectionError, HTTPClientError,
+                                ReadTimeoutError)):
+                return True
+            if isinstance(exc, ClientError):
+                response = exc.response or {}
+                try:
+                    status = int(response.get(
+                        'ResponseMetadata', {}).get('HTTPStatusCode') or 0)
+                except (TypeError, ValueError):
+                    status = 0
+                code = str(response.get('Error', {}).get('Code') or '').lower()
+                return (status in (408, 425, 429) or status >= 500
+                        or code in {'requesttimeout', 'requesttimeoutexception', 'slowdown',
+                                    'throttling', 'throttlingexception', 'internalerror',
+                                    'serviceunavailable'})
+        except ImportError:
+            pass
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        # boto3 wraps some multipart failures in S3UploadFailedError and keeps
+        # the transport cause only in the message.
+        message = str(exc).lower()
+        markers = (
+            'timed out', 'timeout', 'connection reset', 'connection aborted',
+            'connection closed', 'could not connect to the endpoint',
+            'temporarily unavailable', 'service unavailable', 'slowdown',
+            'too many requests', 'internalerror', 'bad gateway', 'gateway timeout',
+        )
+        return any(marker in message for marker in markers)
+
+    @staticmethod
+    def _retry_delay_text(seconds):
+        return f'{seconds // 60} 分钟'
 
     def _update_progress(self, task_id, synced_files, synced_bytes, message):
         with self.db() as db:
@@ -836,6 +1124,7 @@ class R2SyncManager:
                 task = db.execute('SELECT * FROM r2_sync_tasks WHERE id=?', (task_id,)).fetchone()
                 files = db.execute('SELECT * FROM r2_sync_files WHERE task_id=? ORDER BY relative_path',
                                    (task_id,)).fetchall()
+            sync_group = task['sync_group'] if task['sync_group'] in ('video', 'other') else 'other'
             state = {
                 'files': sum(1 for row in files if row['status'] == 'completed'),
                 'bytes': sum(row['size'] for row in files if row['status'] == 'completed'),
@@ -857,6 +1146,7 @@ class R2SyncManager:
                                (time.time(), task_id, row['relative_path']))
                 def progress(amount):
                     self.speed_meter.record(int(amount))
+                    self.group_speed_meters[sync_group].record(int(amount))
                     with state_lock:
                         state['inflight'][row['relative_path']] = (
                             state['inflight'].get(row['relative_path'], 0) + int(amount))
@@ -892,8 +1182,10 @@ class R2SyncManager:
                           if Path(row['relative_path']).suffix.lower() not in ('.m3u8', '.vtt')]
             manifests = [row for row in pending
                          if Path(row['relative_path']).suffix.lower() in ('.m3u8', '.vtt')]
+            file_setting = (config.get('video_file_concurrency') if sync_group == 'video'
+                            else config.get('other_file_concurrency'))
             file_concurrency = max(1, min(
-                self.MAX_FILE_CONCURRENCY, int(config.get('file_concurrency') or 3)))
+                self.MAX_FILE_CONCURRENCY, int(file_setting or 3)))
             if data_files:
                 with ThreadPoolExecutor(max_workers=min(file_concurrency, len(data_files)),
                                         thread_name_prefix='r2-file') as executor:
@@ -911,10 +1203,19 @@ class R2SyncManager:
             with self.db() as db:
                 db.execute("""UPDATE r2_sync_tasks SET status='completed',
                               synced_files=total_files,synced_bytes=total_bytes,
-                              message='同步完成',error=NULL,completed=?,updated=? WHERE id=?""",
+                              message='同步完成',error=NULL,next_retry_at=NULL,
+                              completed=?,updated=? WHERE id=?""",
                            (now, now, task_id))
                 self._set_resource_status(
                     db, task['resource_type'], task['resource_id'], 'synced', now)
+            cleanup_config = self.settings()
+            retention_days = cleanup_config.get('retentionDays')
+            retention_days = 7 if retention_days is None else int(retention_days)
+            if (cleanup_config.get('enabled') and cleanup_config.get('cleanupEnabled')
+                    and retention_days <= 0):
+                if not self._cleanup_local_resource(
+                        task['resource_type'], task['resource_id']):
+                    self._cleanup_wake.set()
         except Exception as exc:
             with self.db() as db:
                 if self._closed.is_set():
@@ -934,15 +1235,36 @@ class R2SyncManager:
                             db, resource['resource_type'], resource['resource_id'], 'syncing')
                 else:
                     message = str(exc)[:500] or type(exc).__name__
-                    db.execute("""UPDATE r2_sync_tasks SET status='failed',message='同步失败',
-                                  error=?,completed=?,updated=? WHERE id=?""",
-                               (message, time.time(), time.time(), task_id))
-                    resource = db.execute('''SELECT resource_type,resource_id
+                    now = time.time()
+                    resource = db.execute('''SELECT resource_type,resource_id,retry_count
                                              FROM r2_sync_tasks WHERE id=?''',
                                           (task_id,)).fetchone()
-                    if resource:
+                    retry_count = int(resource['retry_count'] or 0) if resource else 0
+                    retryable = (resource is not None and self._is_retryable_error(exc)
+                                 and retry_count < len(self.AUTO_RETRY_DELAYS))
+                    if retryable:
+                        delay = self.AUTO_RETRY_DELAYS[retry_count]
+                        retry_count += 1
+                        next_retry = now + delay
+                        db.execute("""UPDATE r2_sync_tasks SET status='queued',
+                                      message=?,error=?,retry_count=?,next_retry_at=?,
+                                      started=NULL,completed=NULL,updated=? WHERE id=?""",
+                                   (f'网络异常，{self._retry_delay_text(delay)}后自动重试'
+                                    f'（{retry_count}/{len(self.AUTO_RETRY_DELAYS)}）',
+                                    message, retry_count, next_retry, now, task_id))
+                        db.execute("""UPDATE r2_sync_files SET status='queued',error=NULL,
+                                      updated=? WHERE task_id=? AND status='uploading'""",
+                                   (now, task_id))
                         self._set_resource_status(
-                            db, resource['resource_type'], resource['resource_id'], 'unsynced')
+                            db, resource['resource_type'], resource['resource_id'], 'syncing')
+                    else:
+                        db.execute("""UPDATE r2_sync_tasks SET status='failed',
+                                      message='同步失败',error=?,next_retry_at=NULL,
+                                      completed=?,updated=? WHERE id=?""",
+                                   (message, now, now, task_id))
+                        if resource:
+                            self._set_resource_status(
+                                db, resource['resource_type'], resource['resource_id'], 'unsynced')
 
     @staticmethod
     def _serialize_task(row):
@@ -950,6 +1272,7 @@ class R2SyncManager:
         done = int(row['synced_bytes'] or 0)
         return dict(id=row['id'], resourceType=row['resource_type'],
                     resourceId=row['resource_id'], source=row['source'], title=row['title'],
+                    syncGroup=row['sync_group'],
                     uploadIdentifier=(row['resource_id'] if row['resource_type'] == 'upload' else None),
                     fileName=row['file_name'], fileType=row['file_type'], status=row['status'],
                     totalFiles=int(row['total_files'] or 0),
@@ -958,11 +1281,14 @@ class R2SyncManager:
                     progress=100.0 if row['status'] == 'completed' else
                     min(99.9, round(done / total * 100, 2)) if total else 0.0,
                     objectKey=row['object_key'], publicUrl=row['public_url'],
+                    retryCount=int(row['retry_count'] or 0),
+                    maxAutoRetries=len(R2SyncManager.AUTO_RETRY_DELAYS),
+                    nextRetryAt=row['next_retry_at'],
                     message=row['message'], error=row['error'], createdAt=row['created'],
                     startedAt=row['started'], completedAt=row['completed'], updatedAt=row['updated'])
 
     def list_tasks(self, page=1, page_size=20, keyword=None, status=None,
-                   resource_type=None):
+                   resource_type=None, sync_group=None):
         conditions, values = [], []
         if keyword:
             escaped = keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
@@ -974,16 +1300,31 @@ class R2SyncManager:
         if resource_type:
             conditions.append('resource_type=?')
             values.append(resource_type)
+        if sync_group:
+            conditions.append('sync_group=?')
+            values.append(sync_group)
         clause = (' WHERE ' + ' AND '.join(conditions)) if conditions else ''
         with self.db() as db:
             total = db.execute('SELECT count(*) FROM r2_sync_tasks' + clause, values).fetchone()[0]
             rows = db.execute('SELECT * FROM r2_sync_tasks' + clause
                               + ' ORDER BY updated DESC,id DESC LIMIT ? OFFSET ?',
                               (*values, page_size, (page - 1) * page_size)).fetchall()
-            counts = db.execute('SELECT status,count(*) total FROM r2_sync_tasks GROUP BY status').fetchall()
+            group_counts = db.execute('''SELECT sync_group,status,count(*) total
+                                         FROM r2_sync_tasks
+                                         GROUP BY sync_group,status''').fetchall()
+        grouped = {
+            'video': {'queued': 0, 'running': 0, 'completed': 0, 'failed': 0},
+            'other': {'queued': 0, 'running': 0, 'completed': 0, 'failed': 0},
+        }
+        counts = {}
+        for row in group_counts:
+            group = row['sync_group'] if row['sync_group'] in grouped else 'other'
+            grouped[group][row['status']] = int(row['total'])
+            counts[row['status']] = counts.get(row['status'], 0) + int(row['total'])
         return {'items': [self._serialize_task(row) for row in rows], 'total': total,
                 'page': page, 'pageSize': page_size,
-                'counts': {row['status']: int(row['total']) for row in counts}}
+                'counts': counts,
+                'groupCounts': grouped}
 
     def retry(self, task_ids):
         retried, skipped = [], []
@@ -996,7 +1337,8 @@ class R2SyncManager:
                     skipped.append(task_id)
                     continue
                 db.execute("""UPDATE r2_sync_tasks SET status='queued',message='等待重试',
-                              error=NULL,started=NULL,completed=NULL,updated=? WHERE id=?""",
+                              error=NULL,retry_count=0,next_retry_at=NULL,
+                              started=NULL,completed=NULL,updated=? WHERE id=?""",
                            (now, task_id))
                 db.execute("""UPDATE r2_sync_files SET status='queued',error=NULL,updated=?
                               WHERE task_id=? AND status<>'completed'""", (now, task_id))

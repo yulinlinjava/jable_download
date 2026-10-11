@@ -9,6 +9,10 @@ const loading = ref(false), metrics = ref<SystemMetrics>(), points = ref<SystemM
 const processes = ref<FfmpegProcess[]>([]), range = ref(60)
 const ranges = [{ label: '5分钟', value: 5 }, { label: '15分钟', value: 15 }, { label: '1小时', value: 60 }, { label: '6小时', value: 360 }, { label: '24小时', value: 1440 }, { label: '3天', value: 4320 }]
 let timer: number | undefined, historyTick = 0
+let currentPromise: Promise<void> | undefined
+let historyPromise: Promise<void> | undefined
+let historyLoadedRange = 0
+let pollingGeneration = 0
 
 const formatBytes = (bytes?: number) => {
   if (!bytes) return '0 B'
@@ -25,33 +29,71 @@ const metricLevel = (value?: number) => (value || 0) >= 90 ? 'danger' : (value |
 const stageText = (value?: string) => ({ probing: '读取信息', compressing: '压缩与切片', segmenting: '视频切片', generating_cover: '生成封面', generating_preview: '生成预览', generating_vtt: '生成进度预览' }[value || ''] || value || '运行中')
 
 async function loadCurrent(silent = false) {
-  if (!silent) loading.value = true
-  try {
-    const [metricResponse, processResponse] = await Promise.all([
-      api.get('/system/metrics'), api.get('/system/ffmpeg-processes'),
-    ])
-    metrics.value = metricResponse.data.data
-    processes.value = processResponse.data.data.items
-  } finally { if (!silent) loading.value = false }
+  if (currentPromise) return currentPromise
+  const request = (async () => {
+    if (!silent) loading.value = true
+    try {
+      const [metricResponse, processResponse] = await Promise.all([
+        api.get('/system/metrics'), api.get('/system/ffmpeg-processes'),
+      ])
+      metrics.value = metricResponse.data.data
+      processes.value = processResponse.data.data.items
+    } finally { if (!silent) loading.value = false }
+  })()
+  currentPromise = request
+  try { await request }
+  finally { if (currentPromise === request) currentPromise = undefined }
 }
 async function loadHistory() {
-  const response = await api.get('/system/metrics/history', { params: { minutes: range.value } })
-  points.value = response.data.data.items
+  if (historyPromise) return historyPromise
+  const requestedRange = range.value
+  const request = (async () => {
+    const response = await api.get('/system/metrics/history', { params: { minutes: requestedRange } })
+    if (range.value === requestedRange) {
+      points.value = response.data.data.items
+      historyLoadedRange = requestedRange
+    }
+  })()
+  historyPromise = request
+  try { await request }
+  finally { if (historyPromise === request) historyPromise = undefined }
 }
 async function refreshAll() { await Promise.all([loadCurrent(), loadHistory()]) }
-async function changeRange(value: number) { range.value = value; await loadHistory() }
-function stopPolling() { if (timer) window.clearInterval(timer); timer = undefined }
-watch(() => props.active, active => {
+async function changeRange(value: number) {
+  range.value = value
+  await loadHistory()
+  if (range.value === value && historyLoadedRange !== value) await loadHistory()
+}
+function stopPolling() {
+  pollingGeneration += 1
+  if (timer) window.clearTimeout(timer)
+  timer = undefined
+}
+async function poll(generation: number, initial = false) {
+  if (!props.active || generation !== pollingGeneration) return
+  try {
+    if (initial) {
+      await refreshAll()
+    } else {
+      await loadCurrent(true)
+      historyTick += 1
+      if (historyTick >= 12) { historyTick = 0; await loadHistory() }
+    }
+  } catch {
+    // 下一轮继续刷新，避免一次瞬时网络错误永久停止监控。
+  }
+  if (props.active && generation === pollingGeneration) {
+    timer = window.setTimeout(() => void poll(generation), 2500)
+  }
+}
+function startPolling() {
   stopPolling()
-  if (!active) return
-  refreshAll()
+  if (!props.active) return
   historyTick = 0
-  timer = window.setInterval(async () => {
-    await loadCurrent(true)
-    historyTick += 1
-    if (historyTick >= 12) { historyTick = 0; await loadHistory() }
-  }, 2500)
-}, { immediate: true })
+  const generation = pollingGeneration
+  void poll(generation, true)
+}
+watch(() => props.active, startPolling, { immediate: true })
 onBeforeUnmount(stopPolling)
 </script>
 

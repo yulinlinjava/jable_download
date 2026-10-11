@@ -13,6 +13,8 @@ const table = ref()
 const settings = ref<FfmpegSettings>({ concurrency: 1, maxConcurrency: 16, paused: false, running: 0, queued: 0, completed: 0, failed: 0, cancelled: 0 })
 const query = reactive({ page: 1, page_size: 20, keyword: '', status: '' })
 let timer: number | undefined
+let loadPromise: Promise<void> | undefined
+let pollingGeneration = 0
 
 const retryable = computed(() => selected.value.filter(item => ['failed', 'cancelled'].includes(item.status)))
 const cancellable = computed(() => selected.value.filter(item => item.status === 'queued'))
@@ -37,17 +39,23 @@ const statusText = (value: string) => ({
 }[value] || value)
 const statusType = (value: string) => ({ completed: 'success', failed: 'danger', queued: 'warning', cancelled: 'info' }[value] || 'primary') as any
 async function load(silent = false) {
-  if (!silent) loading.value = true
-  try {
-    const [taskResponse, settingResponse] = await Promise.all([
-      api.get('/ffmpeg/tasks', { params: query }), api.get('/ffmpeg/settings'),
-    ])
-    tasks.value = taskResponse.data.data.items
-    total.value = taskResponse.data.data.total
-    settings.value = settingResponse.data.data
-  } catch (error: any) {
-    if (!silent) ElMessage.error(error.message)
-  } finally { if (!silent) loading.value = false }
+  if (loadPromise) return loadPromise
+  const request = (async () => {
+    if (!silent) loading.value = true
+    try {
+      const [taskResponse, settingResponse] = await Promise.all([
+        api.get('/ffmpeg/tasks', { params: query }), api.get('/ffmpeg/settings'),
+      ])
+      tasks.value = taskResponse.data.data.items
+      total.value = taskResponse.data.data.total
+      settings.value = settingResponse.data.data
+    } catch (error: any) {
+      if (!silent) ElMessage.error(error.message)
+    } finally { if (!silent) loading.value = false }
+  })()
+  loadPromise = request
+  try { await request }
+  finally { if (loadPromise === request) loadPromise = undefined }
 }
 function search() { query.page = 1; table.value?.clearSelection(); selected.value = []; load() }
 async function retry(ids: string[]) {
@@ -72,11 +80,25 @@ async function remove(row: FfmpegTask) {
   catch (error: any) { ElMessage.error(error.message) }
 }
 
-function stopPolling() { if (timer) window.clearInterval(timer); timer = undefined }
-watch(() => props.active, active => {
+function stopPolling() {
+  pollingGeneration += 1
+  if (timer) window.clearTimeout(timer)
+  timer = undefined
+}
+async function poll(generation: number, silent = false) {
+  if (!props.active || generation !== pollingGeneration) return
+  await load(silent)
+  if (props.active && generation === pollingGeneration) {
+    timer = window.setTimeout(() => void poll(generation, true), 2500)
+  }
+}
+function startPolling() {
   stopPolling()
-  if (active) { load(); timer = window.setInterval(() => load(true), 2500) }
-}, { immediate: true })
+  if (!props.active) return
+  const generation = pollingGeneration
+  void poll(generation)
+}
+watch(() => props.active, startPolling, { immediate: true })
 onBeforeUnmount(stopPolling)
 </script>
 

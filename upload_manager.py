@@ -58,6 +58,8 @@ def bounded_env(name, default, minimum, maximum):
 
 class UploadManager:
     BUFFER_SIZE = 1024 * 1024
+    BACKGROUND_RETRY_MAX_SECONDS = 60
+    BACKGROUND_ERROR_LOG_INTERVAL = 60
     BLOCKED_EXTENSIONS = {
         # Server-side scripts and source code.
         '.asp', '.aspx', '.ashx', '.asmx', '.c', '.cc', '.cgi', '.class',
@@ -108,6 +110,7 @@ class UploadManager:
                   preview_path TEXT, vtt_path TEXT, preview_m3u8_path TEXT,
                   preview5_m3u8_path TEXT, source_file TEXT,
                   duration REAL, width INTEGER, height INTEGER,
+                  is_portrait INTEGER NOT NULL DEFAULT 0, image_format TEXT,
                   video_codec TEXT, audio_codec TEXT, bit_rate INTEGER,
                   original_size INTEGER, processed_size INTEGER,
                   compressed INTEGER NOT NULL DEFAULT 0, compression_ratio REAL,
@@ -122,6 +125,8 @@ class UploadManager:
                   ON uploads(updated DESC,identifier);
                 CREATE INDEX IF NOT EXISTS uploads_type_status_updated
                   ON uploads(file_type,status,updated DESC);
+                CREATE INDEX IF NOT EXISTS uploads_status_updated
+                  ON uploads(status,updated DESC,identifier);
                 CREATE INDEX IF NOT EXISTS uploads_name
                   ON uploads(file_name COLLATE NOCASE);
                 CREATE TABLE IF NOT EXISTS ffmpeg_tasks (
@@ -139,11 +144,20 @@ class UploadManager:
                   ON ffmpeg_tasks(updated DESC,id);
                 CREATE TABLE IF NOT EXISTS ffmpeg_settings (
                   key TEXT PRIMARY KEY, value TEXT NOT NULL, updated REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS upload_chunk_cleanup_queue (
+                  identifier TEXT PRIMARY KEY,
+                  expires_at REAL NOT NULL,
+                  chunk_bytes INTEGER NOT NULL DEFAULT 0,
+                  uploaded_count INTEGER NOT NULL DEFAULT 0,
+                  updated REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS upload_chunk_cleanup_expiry
+                  ON upload_chunk_cleanup_queue(expires_at);
             ''')
             columns = {row['name'] for row in db.execute('PRAGMA table_info(uploads)')}
             migrations = {
                 'preview_m3u8_path': 'TEXT', 'preview5_m3u8_path': 'TEXT',
                 'duration': 'REAL', 'width': 'INTEGER', 'height': 'INTEGER',
+                'is_portrait': 'INTEGER NOT NULL DEFAULT 0', 'image_format': 'TEXT',
                 'video_codec': 'TEXT', 'audio_codec': 'TEXT', 'bit_rate': 'INTEGER',
                 'original_size': 'INTEGER', 'processed_size': 'INTEGER',
                 'compressed': 'INTEGER NOT NULL DEFAULT 0', 'compression_ratio': 'REAL',
@@ -173,6 +187,11 @@ class UploadManager:
                               WHERE r.resource_type='upload' AND r.resource_id=uploads.identifier
                               AND r.status='completed' ORDER BY r.completed DESC LIMIT 1))
                               WHERE r2_synced=1""")
+            db.execute('DROP INDEX IF EXISTS uploads_chunk_expiry')
+            db.execute('''DELETE FROM upload_chunk_cleanup_queue
+                          WHERE NOT EXISTS(SELECT 1 FROM uploads
+                            WHERE uploads.identifier=upload_chunk_cleanup_queue.identifier
+                              AND uploads.status='uploading')''')
         self._public_base_url_getter = public_base_url_getter
         self.public_base_url = os.getenv('PUBLIC_BASE_URL', 'http://localhost:8000').rstrip('/')
         self.max_chunk_bytes = positive_env('UPLOAD_CHUNK_MAX_BYTES', 50 * 1024 * 1024)
@@ -182,14 +201,18 @@ class UploadManager:
         self.preview_interval = positive_env('UPLOAD_PREVIEW_INTERVAL', 10)
         self.video_timeout = positive_env('UPLOAD_VIDEO_TIMEOUT', 3600)
         self.compress_enabled = boolean_env('UPLOAD_COMPRESS_ENABLED', True)
+        self.compress_compatibility_only = boolean_env(
+            'UPLOAD_COMPATIBILITY_ONLY_COMPRESSION', True)
+        self.generate_hover_preview = boolean_env('UPLOAD_GENERATE_HOVER_PREVIEW', True)
+        self.generate_vtt_preview = boolean_env('UPLOAD_GENERATE_VTT_PREVIEW', True)
         self.compress_min_bytes = positive_env('UPLOAD_COMPRESS_MIN_BYTES', 500 * 1024 * 1024)
         self.compress_min_duration = positive_env('UPLOAD_COMPRESS_MIN_DURATION', 30 * 60)
         self.compress_max_width = positive_env('UPLOAD_COMPRESS_MAX_WIDTH', 1920)
-        self.compress_max_height = positive_env('UPLOAD_COMPRESS_MAX_HEIGHT', 1080)
+        self.compress_max_height = positive_env('UPLOAD_COMPRESS_MAX_HEIGHT', 1920)
         self.compress_max_video_bitrate = positive_env(
             'UPLOAD_COMPRESS_MAX_VIDEO_BITRATE', 5_000_000)
         self.compress_crf = bounded_env('UPLOAD_COMPRESS_CRF', 25, 0, 51)
-        self.compress_preset = os.getenv('UPLOAD_COMPRESS_PRESET', 'veryfast').strip().lower()
+        self.compress_preset = os.getenv('UPLOAD_COMPRESS_PRESET', 'superfast').strip().lower()
         if self.compress_preset not in {
                 'ultrafast', 'superfast', 'veryfast', 'faster', 'fast',
                 'medium', 'slow', 'slower', 'veryslow'}:
@@ -204,6 +227,34 @@ class UploadManager:
                 db.execute('''INSERT OR IGNORE INTO ffmpeg_settings(key,value,updated)
                               VALUES(?,?,?)''', (key, str(value), now))
         self._reload_compression_settings()
+        self.image_compress_enabled = boolean_env('UPLOAD_IMAGE_COMPRESS_ENABLED', True)
+        self.image_compress_min_bytes = positive_env(
+            'UPLOAD_IMAGE_COMPRESS_MIN_BYTES', 5 * 1024 * 1024)
+        self.image_compress_quality = bounded_env(
+            'UPLOAD_IMAGE_COMPRESS_QUALITY', 82, 1, 100)
+        self._image_compression_defaults = self._image_compression_snapshot()
+        with self.db() as db:
+            now = time.time()
+            for key, value in self._image_compression_storage(
+                    self._image_compression_defaults).items():
+                db.execute('''INSERT OR IGNORE INTO ffmpeg_settings(key,value,updated)
+                              VALUES(?,?,?)''', (key, str(value), now))
+        self._reload_image_compression_settings()
+        self.chunk_cleanup_enabled = boolean_env('UPLOAD_CHUNK_CLEANUP_ENABLED', True)
+        self.chunk_retention_days = bounded_env(
+            'UPLOAD_CHUNK_RETENTION_DAYS', 7, 1, 3650)
+        self._chunk_cleanup_defaults = {
+            'enabled': self.chunk_cleanup_enabled,
+            'retentionDays': self.chunk_retention_days,
+        }
+        with self.db() as db:
+            now = time.time()
+            for key, value in (
+                    ('chunk_cleanup.enabled', int(self.chunk_cleanup_enabled)),
+                    ('chunk_cleanup.retention_days', self.chunk_retention_days)):
+                db.execute('''INSERT OR IGNORE INTO ffmpeg_settings(key,value,updated)
+                              VALUES(?,?,?)''', (key, str(value), now))
+        self._reload_chunk_cleanup_settings()
         self.preview_generator = MediaPreviewGenerator(self.video_timeout, self.preview_interval)
         self.merge_workers = positive_env('UPLOAD_MERGE_WORKERS', 1)
         self.ffmpeg_max_concurrency = positive_env('UPLOAD_FFMPEG_MAX_CONCURRENCY', 16)
@@ -230,6 +281,7 @@ class UploadManager:
         self._runtime_lock = threading.RLock()
         self._ffmpeg_runtime = {}
         self._ffmpeg_wakeup = threading.Event()
+        self._chunk_cleanup_wakeup = threading.Event()
         self._closed = threading.Event()
         self._executor = ThreadPoolExecutor(max_workers=self.merge_workers,
                                             thread_name_prefix='upload-merge')
@@ -237,6 +289,8 @@ class UploadManager:
             max_workers=self.ffmpeg_max_concurrency, thread_name_prefix='upload-ffmpeg')
         self._ffmpeg_dispatcher = threading.Thread(
             target=self._ffmpeg_dispatch_loop, name='upload-ffmpeg-dispatch', daemon=True)
+        self._chunk_cleanup_thread = threading.Thread(
+            target=self._chunk_cleanup_loop, name='upload-chunk-cleanup', daemon=True)
         # A process restart means no upload is still writing these private files.
         for temporary in self.files_root.glob('.*.part'):
             temporary.unlink(missing_ok=True)
@@ -255,12 +309,16 @@ class UploadManager:
                     log.exception('Unable to resume upload merge %s', metadata.get('identifier'))
         self._ffmpeg_dispatcher.start()
         self._ffmpeg_wakeup.set()
+        self._chunk_cleanup_thread.start()
 
     def close(self):
         self._closed.set()
         self._ffmpeg_wakeup.set()
+        self._chunk_cleanup_wakeup.set()
         if self._ffmpeg_dispatcher.is_alive():
             self._ffmpeg_dispatcher.join(timeout=2)
+        if self._chunk_cleanup_thread.is_alive():
+            self._chunk_cleanup_thread.join(timeout=2)
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._ffmpeg_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -320,10 +378,19 @@ class UploadManager:
         with self._guard:
             return self._locks.setdefault(identifier, threading.RLock())
 
+    @classmethod
+    def _background_retry_delay(cls, failures, base=1):
+        return min(
+            cls.BACKGROUND_RETRY_MAX_SECONDS,
+            max(1, base) * (2 ** min(max(0, failures - 1), 6)))
+
     def _compression_snapshot(self):
         with self._config_lock:
             return {
                 'enabled': bool(self.compress_enabled),
+                'compatibilityOnly': bool(self.compress_compatibility_only),
+                'generateHoverPreview': bool(self.generate_hover_preview),
+                'generateVttPreview': bool(self.generate_vtt_preview),
                 'minBytes': int(self.compress_min_bytes),
                 'minDuration': int(self.compress_min_duration),
                 'maxWidth': int(self.compress_max_width),
@@ -338,6 +405,9 @@ class UploadManager:
     def _compression_storage(config):
         return {
             'compression.enabled': int(bool(config['enabled'])),
+            'compression.compatibility_only': int(bool(config['compatibilityOnly'])),
+            'preview.hover_enabled': int(bool(config['generateHoverPreview'])),
+            'preview.vtt_enabled': int(bool(config['generateVttPreview'])),
             'compression.min_bytes': int(config['minBytes']),
             'compression.min_duration': int(config['minDuration']),
             'compression.max_width': int(config['maxWidth']),
@@ -352,6 +422,9 @@ class UploadManager:
     def _apply_compression_snapshot(self, config):
         with self._config_lock:
             self.compress_enabled = bool(config['enabled'])
+            self.compress_compatibility_only = bool(config['compatibilityOnly'])
+            self.generate_hover_preview = bool(config['generateHoverPreview'])
+            self.generate_vtt_preview = bool(config['generateVttPreview'])
             self.compress_min_bytes = int(config['minBytes'])
             self.compress_min_duration = int(config['minDuration'])
             self.compress_max_width = int(config['maxWidth'])
@@ -374,6 +447,15 @@ class UploadManager:
         try:
             config = {
                 'enabled': stored.get('compression.enabled', '1') == '1',
+                'compatibilityOnly': stored.get(
+                    'compression.compatibility_only',
+                    '1' if defaults['compatibilityOnly'] else '0') == '1',
+                'generateHoverPreview': stored.get(
+                    'preview.hover_enabled',
+                    '1' if defaults['generateHoverPreview'] else '0') == '1',
+                'generateVttPreview': stored.get(
+                    'preview.vtt_enabled',
+                    '1' if defaults['generateVttPreview'] else '0') == '1',
                 'minBytes': int(stored.get('compression.min_bytes', defaults['minBytes'])),
                 'minDuration': int(stored.get('compression.min_duration', defaults['minDuration'])),
                 'maxWidth': int(stored.get('compression.max_width', defaults['maxWidth'])),
@@ -416,6 +498,9 @@ class UploadManager:
         config = self._compression_snapshot()
         return {
             'enabled': config['enabled'],
+            'compatibilityOnly': config['compatibilityOnly'],
+            'generateHoverPreview': config['generateHoverPreview'],
+            'generateVttPreview': config['generateVttPreview'],
             'minFileSizeMb': round(config['minBytes'] / 1024 / 1024, 2),
             'minDurationMinutes': round(config['minDuration'] / 60, 2),
             'maxVideoBitrateMbps': round(config['maxVideoBitrate'] / 1_000_000, 3),
@@ -431,6 +516,9 @@ class UploadManager:
         try:
             config = {
                 'enabled': bool(values['enabled']),
+                'compatibilityOnly': bool(values['compatibilityOnly']),
+                'generateHoverPreview': bool(values['generateHoverPreview']),
+                'generateVttPreview': bool(values['generateVttPreview']),
                 'minBytes': round(float(values['minFileSizeMb']) * 1024 * 1024),
                 'minDuration': round(float(values['minDurationMinutes']) * 60),
                 'maxVideoBitrate': round(float(values['maxVideoBitrateMbps']) * 1_000_000),
@@ -464,18 +552,291 @@ class UploadManager:
             self._apply_compression_snapshot(config)
         return self.compression_settings()
 
-    def _ffmpeg_concurrency(self):
+    def _image_compression_snapshot(self):
+        with self._config_lock:
+            return {
+                'enabled': bool(self.image_compress_enabled),
+                'minBytes': int(self.image_compress_min_bytes),
+                'quality': int(self.image_compress_quality),
+            }
+
+    @staticmethod
+    def _image_compression_storage(config):
+        return {
+            'image_compression.enabled': int(bool(config['enabled'])),
+            'image_compression.min_bytes': int(config['minBytes']),
+            'image_compression.quality': int(config['quality']),
+        }
+
+    @staticmethod
+    def _validate_image_compression_snapshot(config):
+        min_bytes = config.get('minBytes')
+        quality = config.get('quality')
+        if (not isinstance(min_bytes, int) or min_bytes < 100 * 1024
+                or min_bytes > 100 * 1024 * 1024 * 1024):
+            raise UploadError(400, 40024, '图片压缩大小阈值超出允许范围')
+        if not isinstance(quality, int) or quality < 1 or quality > 100:
+            raise UploadError(400, 40024, '图片压缩质量必须在 1 到 100 之间')
+        return config
+
+    def _apply_image_compression_snapshot(self, config):
+        with self._config_lock:
+            self.image_compress_enabled = bool(config['enabled'])
+            self.image_compress_min_bytes = int(config['minBytes'])
+            self.image_compress_quality = int(config['quality'])
+
+    def _reload_image_compression_settings(self):
+        defaults = dict(self._image_compression_defaults)
+        keys = tuple(self._image_compression_storage(defaults))
+        placeholders = ','.join('?' for _ in keys)
         with self.db() as db:
-            row = db.execute(
-                "SELECT value FROM ffmpeg_settings WHERE key='concurrency'").fetchone()
+            rows = db.execute(
+                f'SELECT key,value FROM ffmpeg_settings WHERE key IN ({placeholders})',
+                keys).fetchall()
+        stored = {row['key']: row['value'] for row in rows}
+        try:
+            config = {
+                'enabled': stored.get('image_compression.enabled', '1') == '1',
+                'minBytes': int(stored.get(
+                    'image_compression.min_bytes', defaults['minBytes'])),
+                'quality': int(stored.get(
+                    'image_compression.quality', defaults['quality'])),
+            }
+            self._validate_image_compression_snapshot(config)
+        except (TypeError, ValueError, UploadError):
+            log.warning('Invalid stored image compression settings; using environment defaults')
+            config = defaults
+        self._apply_image_compression_snapshot(config)
+
+    def image_compression_settings(self):
+        config = self._image_compression_snapshot()
+        return {
+            'enabled': config['enabled'],
+            'minFileSizeMb': round(config['minBytes'] / 1024 / 1024, 2),
+            'quality': config['quality'],
+        }
+
+    def set_image_compression_settings(self, values):
+        try:
+            config = {
+                'enabled': bool(values['enabled']),
+                'minBytes': round(float(values['minFileSizeMb']) * 1024 * 1024),
+                'quality': int(values['quality']),
+            }
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UploadError(400, 40024, '图片压缩配置格式无效') from exc
+        self._validate_image_compression_snapshot(config)
+        now = time.time()
+        with self._config_lock:
+            with self.db() as db:
+                for key, value in self._image_compression_storage(config).items():
+                    db.execute('''INSERT INTO ffmpeg_settings(key,value,updated) VALUES(?,?,?)
+                                  ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                  updated=excluded.updated''', (key, str(value), now))
+            self._apply_image_compression_snapshot(config)
+        return self.image_compression_settings()
+
+    def _reload_chunk_cleanup_settings(self):
+        defaults = self._chunk_cleanup_defaults
+        with self.db() as db:
+            rows = db.execute('''SELECT key,value FROM ffmpeg_settings
+                WHERE key IN ('chunk_cleanup.enabled','chunk_cleanup.retention_days')''').fetchall()
+        stored = {row['key']: row['value'] for row in rows}
+        try:
+            enabled = stored.get('chunk_cleanup.enabled', '1') == '1'
+            retention_days = int(stored.get(
+                'chunk_cleanup.retention_days', defaults['retentionDays']))
+            if retention_days < 1 or retention_days > 3650:
+                raise ValueError()
+        except (TypeError, ValueError):
+            enabled = bool(defaults['enabled'])
+            retention_days = int(defaults['retentionDays'])
+        with self._config_lock:
+            self.chunk_cleanup_enabled = enabled
+            self.chunk_retention_days = retention_days
+
+    def chunk_cleanup_settings(self):
+        with self._config_lock:
+            enabled = bool(self.chunk_cleanup_enabled)
+            retention_days = int(self.chunk_retention_days)
+        with self.db() as db:
+            summary = db.execute('''SELECT count(*) total,
+                coalesce(sum(chunk_bytes),0) bytes,
+                coalesce(sum(CASE WHEN expires_at<=? THEN 1 ELSE 0 END),0) expired
+                FROM upload_chunk_cleanup_queue''',
+                                 (time.time(),)).fetchone()
+            stored = {row['key']: row['value'] for row in db.execute('''SELECT key,value
+                FROM ffmpeg_settings WHERE key IN ('chunk_cleanup.last_run',
+                'chunk_cleanup.last_deleted','chunk_cleanup.last_bytes')''')}
+        return {
+            'enabled': enabled, 'retentionDays': retention_days,
+            'incompleteCount': int(summary['total'] or 0),
+            'incompleteBytes': int(summary['bytes'] or 0),
+            'expiredCount': int(summary['expired'] or 0),
+            'lastCleanupAt': float(stored.get('chunk_cleanup.last_run') or 0),
+            'lastDeleted': int(stored.get('chunk_cleanup.last_deleted') or 0),
+            'lastFreedBytes': int(stored.get('chunk_cleanup.last_bytes') or 0),
+        }
+
+    def set_chunk_cleanup_settings(self, values):
+        try:
+            enabled = bool(values['enabled'])
+            retention_days = int(values['retentionDays'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise UploadError(400, 40025, '分片清理配置格式无效') from exc
+        if retention_days < 1 or retention_days > 3650:
+            raise UploadError(400, 40025, '分片保留天数必须在 1 到 3650 之间')
+        now = time.time()
+        with self._config_lock:
+            with self.db() as db:
+                for key, value in (
+                        ('chunk_cleanup.enabled', int(enabled)),
+                        ('chunk_cleanup.retention_days', retention_days)):
+                    db.execute('''INSERT INTO ffmpeg_settings(key,value,updated) VALUES(?,?,?)
+                                  ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                  updated=excluded.updated''', (key, str(value), now))
+                db.execute('''UPDATE upload_chunk_cleanup_queue
+                              SET expires_at=updated + ?''',
+                           (retention_days * 86400,))
+            self.chunk_cleanup_enabled = enabled
+            self.chunk_retention_days = retention_days
+        if hasattr(self, '_chunk_cleanup_wakeup'):
+            self._chunk_cleanup_wakeup.set()
+        return self.chunk_cleanup_settings()
+
+    def cleanup_expired_chunks(self):
+        with self._config_lock:
+            enabled = bool(self.chunk_cleanup_enabled)
+        if not enabled:
+            return dict(deleted=0, freedBytes=0, skipped=0, enabled=False)
+        now, deleted, freed_bytes, skipped = time.time(), 0, 0, 0
+        delete_failures = 0
+        first_delete_error = None
+        while not self._closed.is_set():
+            with self.db() as db:
+                rows = db.execute('''SELECT identifier,chunk_bytes,expires_at
+                    FROM upload_chunk_cleanup_queue WHERE expires_at<=?
+                    ORDER BY expires_at LIMIT 100''',
+                                  (now,)).fetchall()
+            if not rows:
+                break
+            made_progress = False
+            for candidate in rows:
+                identifier = candidate['identifier']
+                with self._lock(identifier):
+                    with self.db() as db:
+                        queued = db.execute('''SELECT expires_at,chunk_bytes
+                            FROM upload_chunk_cleanup_queue WHERE identifier=?''',
+                                            (identifier,)).fetchone()
+                        current = db.execute('SELECT status FROM uploads WHERE identifier=?',
+                                             (identifier,)).fetchone()
+                    if not queued or queued['expires_at'] > time.time():
+                        skipped += 1
+                        continue
+                    if current and current['status'] != 'uploading':
+                        with self.db() as db:
+                            db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                                       (identifier,))
+                        made_progress = True
+                        skipped += 1
+                        continue
+                    session = self._session(identifier)
+                    disk_bytes = 0
+                    try:
+                        if session.is_dir():
+                            disk_bytes = sum(path.stat().st_size for path in session.rglob('*')
+                                             if path.is_file())
+                            shutil.rmtree(session)
+                        with self.db() as db:
+                            removed = db.execute('''DELETE FROM uploads WHERE identifier=?
+                                                    AND status='uploading' ''',
+                                                 (identifier,)).rowcount
+                            db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                                       (identifier,))
+                        made_progress = True
+                        if removed or not current:
+                            deleted += 1
+                            freed_bytes += disk_bytes or int(queued['chunk_bytes'] or 0)
+                        else:
+                            skipped += 1
+                    except OSError as exc:
+                        skipped += 1
+                        delete_failures += 1
+                        if first_delete_error is None:
+                            first_delete_error = (identifier, exc)
+            if len(rows) < 100 or not made_progress:
+                break
+        if first_delete_error:
+            identifier, exc = first_delete_error
+            log.warning(
+                'Unable to delete %s expired upload chunk directories; first=%s: %s',
+                delete_failures, identifier, exc)
+        finished = time.time()
+        with self.db() as db:
+            for key, value in (
+                    ('chunk_cleanup.last_run', finished),
+                    ('chunk_cleanup.last_deleted', deleted),
+                    ('chunk_cleanup.last_bytes', freed_bytes)):
+                db.execute('''INSERT INTO ffmpeg_settings(key,value,updated) VALUES(?,?,?)
+                              ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                              updated=excluded.updated''', (key, str(value), finished))
+        return dict(deleted=deleted, freedBytes=freed_bytes, skipped=skipped,
+                    enabled=True, completedAt=finished)
+
+    def _chunk_cleanup_loop(self):
+        failures = 0
+        retry_delay = 0
+        last_error_log = 0.0
+        while not self._closed.is_set():
+            if retry_delay:
+                if self._closed.wait(retry_delay):
+                    break
+                self._chunk_cleanup_wakeup.clear()
+            try:
+                self.cleanup_expired_chunks()
+                with self._config_lock:
+                    enabled = bool(self.chunk_cleanup_enabled)
+                next_expiry = None
+                if enabled:
+                    with self.db() as db:
+                        row = db.execute(
+                            'SELECT min(expires_at) expires_at FROM upload_chunk_cleanup_queue').fetchone()
+                        next_expiry = row['expires_at'] if row else None
+            except Exception as exc:
+                failures += 1
+                retry_delay = self._background_retry_delay(failures)
+                now = time.monotonic()
+                if (failures == 1
+                        or now - last_error_log >= self.BACKGROUND_ERROR_LOG_INTERVAL):
+                    log.warning(
+                        'Upload chunk cleanup unavailable; retrying in %ss: %s',
+                        retry_delay, exc)
+                    last_error_log = now
+                continue
+            if failures:
+                log.info('Upload chunk cleanup recovered after %s failures', failures)
+            failures = 0
+            retry_delay = 0
+            timeout = (None if not enabled or next_expiry is None
+                       else 60 if next_expiry <= time.time()
+                       else max(0.1, next_expiry - time.time()))
+            self._chunk_cleanup_wakeup.wait(timeout)
+            self._chunk_cleanup_wakeup.clear()
+
+    def _ffmpeg_concurrency(self, db=None):
+        if db is None:
+            with self.db() as connection:
+                return self._ffmpeg_concurrency(connection)
+        row = db.execute(
+            "SELECT value FROM ffmpeg_settings WHERE key='concurrency'").fetchone()
         try:
             return max(0, min(self.ffmpeg_max_concurrency, int(row['value'] if row else 1)))
         except (TypeError, ValueError):
             return 1
 
     def ffmpeg_settings(self):
-        concurrency = self._ffmpeg_concurrency()
         with self.db() as db:
+            concurrency = self._ffmpeg_concurrency(db)
             rows = db.execute('SELECT status,count(*) AS total FROM ffmpeg_tasks GROUP BY status').fetchall()
         counts = {row['status']: row['total'] for row in rows}
         running = sum(value for key, value in counts.items()
@@ -525,13 +886,36 @@ class UploadManager:
         return identifier
 
     def _ffmpeg_dispatch_loop(self):
+        failures = 0
+        retry_delay = 0
+        last_error_log = 0.0
         while not self._closed.is_set():
-            self._ffmpeg_wakeup.wait(timeout=1)
-            self._ffmpeg_wakeup.clear()
+            if retry_delay:
+                if self._closed.wait(retry_delay):
+                    break
+                self._ffmpeg_wakeup.clear()
+            else:
+                self._ffmpeg_wakeup.wait(timeout=1)
+                self._ffmpeg_wakeup.clear()
+                if self._closed.is_set():
+                    break
             try:
                 self._dispatch_ffmpeg_tasks()
-            except Exception:
-                log.exception('Unable to dispatch FFmpeg tasks')
+            except Exception as exc:
+                failures += 1
+                retry_delay = self._background_retry_delay(failures)
+                now = time.monotonic()
+                if (failures == 1
+                        or now - last_error_log >= self.BACKGROUND_ERROR_LOG_INTERVAL):
+                    log.warning(
+                        'FFmpeg task dispatch unavailable; retrying in %ss: %s',
+                        retry_delay, exc)
+                    last_error_log = now
+            else:
+                if failures:
+                    log.info('FFmpeg task dispatch recovered after %s failures', failures)
+                failures = 0
+                retry_delay = 0
 
     def _dispatch_ffmpeg_tasks(self):
         concurrency = self._ffmpeg_concurrency()
@@ -663,7 +1047,7 @@ class UploadManager:
                 metadata = self._read_metadata(self._session(identifier))
                 metadata.update({'status': 'cancelled', 'processingStage': 'cancelled',
                                  'message': 'FFmpeg 任务已取消', 'updatedAt': now})
-                self._save_metadata(metadata)
+                self._save_metadata(metadata, remove_chunk_cleanup=True)
             cancelled.append(identifier)
         return {'cancelled': cancelled, 'skipped': skipped}
 
@@ -790,6 +1174,7 @@ class UploadManager:
             'preview5M3u8Path': row['preview5_m3u8_path'], 'sourceFile': row['source_file'],
             'duration': row['duration'], 'durationText': self._duration_text(row['duration']),
             'width': row['width'], 'height': row['height'],
+            'isPortrait': bool(row['is_portrait']), 'imageFormat': row['image_format'],
             'videoCodec': row['video_codec'], 'audioCodec': row['audio_codec'],
             'bitRate': row['bit_rate'], 'originalSize': row['original_size'],
             'processedSize': row['processed_size'], 'compressed': bool(row['compressed']),
@@ -813,7 +1198,7 @@ class UploadManager:
             return self._metadata_from_row(
                 db.execute('SELECT * FROM uploads WHERE identifier=?', (identifier,)).fetchone())
 
-    def _save_metadata(self, data):
+    def _save_metadata(self, data, chunk_expiry=None, remove_chunk_cleanup=False):
         identifier = self.identifier(data['identifier'])
         now = time.time()
         values = (
@@ -826,7 +1211,8 @@ class UploadManager:
             data.get('hlsPath'), data.get('coverPath'), data.get('posterPath'),
             data.get('previewPath'), data.get('vttPath'), data.get('previewM3u8Path'),
             data.get('preview5M3u8Path'), data.get('sourceFile'), data.get('duration'),
-            data.get('width'), data.get('height'), data.get('videoCodec'),
+            data.get('width'), data.get('height'), int(bool(data.get('isPortrait'))),
+            data.get('imageFormat'), data.get('videoCodec'),
             data.get('audioCodec'), data.get('bitRate'), data.get('originalSize'),
             data.get('processedSize'), int(bool(data.get('compressed'))),
             data.get('compressionRatio'), int(bool(data.get('r2SyncEnabled'))),
@@ -837,14 +1223,15 @@ class UploadManager:
             data.get('createdAt') or now, data.get('updatedAt') or now,
         )
         with self.db() as db:
-            db.execute('''INSERT INTO uploads(identifier,file_name,file_type,media_type,size,
+            db.execute(f'''INSERT INTO uploads(identifier,file_name,file_type,media_type,size,
                 total_chunks,uploaded_count,completed,original_deleted,status,processing_stage,
                 message,error,warnings,path,hls_path,cover_path,poster_path,preview_path,vtt_path,
                 preview_m3u8_path,preview5_m3u8_path,source_file,duration,width,height,
-                video_codec,audio_codec,bit_rate,original_size,processed_size,compressed,
+                is_portrait,image_format,video_codec,audio_codec,bit_rate,
+                original_size,processed_size,compressed,
                 compression_ratio,r2_sync_enabled,r2_synced,r2_sync_status,r2_synced_at,
                 local_deleted,local_deleted_at,created,updated)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                VALUES({','.join('?' for _ in values)})
                 ON CONFLICT(identifier) DO UPDATE SET
                 file_name=excluded.file_name,file_type=excluded.file_type,
                 media_type=excluded.media_type,size=excluded.size,total_chunks=excluded.total_chunks,
@@ -857,7 +1244,9 @@ class UploadManager:
                 preview_m3u8_path=excluded.preview_m3u8_path,
                 preview5_m3u8_path=excluded.preview5_m3u8_path,
                 source_file=excluded.source_file,duration=excluded.duration,
-                width=excluded.width,height=excluded.height,video_codec=excluded.video_codec,
+                width=excluded.width,height=excluded.height,
+                is_portrait=excluded.is_portrait,image_format=excluded.image_format,
+                video_codec=excluded.video_codec,
                 audio_codec=excluded.audio_codec,bit_rate=excluded.bit_rate,
                 original_size=excluded.original_size,processed_size=excluded.processed_size,
                 compressed=excluded.compressed,compression_ratio=excluded.compression_ratio,
@@ -868,6 +1257,17 @@ class UploadManager:
                 local_deleted=excluded.local_deleted,
                 local_deleted_at=excluded.local_deleted_at,
                 updated=excluded.updated''', values)
+            if chunk_expiry is not None:
+                db.execute('''INSERT INTO upload_chunk_cleanup_queue(
+                    identifier,expires_at,chunk_bytes,uploaded_count,updated)
+                    VALUES(?,?,?,?,?) ON CONFLICT(identifier) DO UPDATE SET
+                    expires_at=excluded.expires_at,chunk_bytes=excluded.chunk_bytes,
+                    uploaded_count=excluded.uploaded_count,updated=excluded.updated''',
+                           (identifier, float(chunk_expiry), int(data.get('size') or 0),
+                            int(data.get('uploadedCount') or 0), now))
+            elif remove_chunk_cleanup:
+                db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                           (identifier,))
 
     @staticmethod
     def _chunk_numbers(session):
@@ -935,7 +1335,8 @@ class UploadManager:
             result['processingStage'] = metadata.get('processingStage') or metadata.get('status')
             result['warnings'] = metadata.get('warnings') or []
             for field in ('duration', 'durationText', 'width', 'height', 'videoCodec',
-                          'audioCodec', 'bitRate', 'originalSize', 'processedSize',
+                          'isPortrait', 'imageFormat', 'audioCodec', 'bitRate',
+                          'originalSize', 'processedSize',
                           'compressed', 'compressionRatio'):
                 result[field] = metadata.get(field)
         return result
@@ -1009,7 +1410,7 @@ class UploadManager:
             return subprocess.run(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, timeout=timeout or self.video_timeout, check=False)
-        except subprocess.TimeoutExpired:
+        except (subprocess.TimeoutExpired, OSError):
             return None
 
     def _run_ffmpeg_media_command(self, command, duration, progress_callback,
@@ -1019,11 +1420,33 @@ class UploadManager:
             command[5:5] = ['-progress', 'pipe:1', '-nostats']
         started = time.monotonic()
         last_update = 0.0
+        progress_failures = 0
+        progress_retry_at = 0.0
+        progress_last_error_log = 0.0
         def emit(percent):
+            nonlocal progress_failures, progress_retry_at, progress_last_error_log
+            now = time.monotonic()
+            if now < progress_retry_at:
+                return
             try:
                 progress_callback(percent)
-            except Exception:
-                log.exception('Unable to persist FFmpeg progress')
+            except Exception as exc:
+                progress_failures += 1
+                retry_delay = self._background_retry_delay(progress_failures)
+                progress_retry_at = now + retry_delay
+                if (progress_failures == 1
+                        or now - progress_last_error_log >= self.BACKGROUND_ERROR_LOG_INTERVAL):
+                    log.warning(
+                        'FFmpeg progress persistence unavailable; retrying in %ss: %s',
+                        retry_delay, exc)
+                    progress_last_error_log = now
+            else:
+                if progress_failures:
+                    log.info(
+                        'FFmpeg progress persistence recovered after %s failures',
+                        progress_failures)
+                progress_failures = 0
+                progress_retry_at = 0.0
         try:
             process = subprocess.Popen(
                 command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -1083,7 +1506,8 @@ class UploadManager:
         result = self._run_media_command([
             'ffprobe', '-v', 'error',
             '-show_entries', 'format=duration,size,bit_rate:'
-                             'stream=codec_type,codec_name,width,height,bit_rate',
+                             'stream=codec_type,codec_name,width,height,bit_rate:'
+                             'stream_tags=rotate:stream_side_data=rotation',
             '-of', 'json', str(source),
         ], min(self.video_timeout, 60))
         if not result or result.returncode:
@@ -1101,6 +1525,7 @@ class UploadManager:
         original_size = self._number(format_data.get('size')) or source.stat().st_size
         total_bit_rate = self._number(format_data.get('bit_rate'))
         video_bit_rate = self._number(video.get('bit_rate'))
+        width, height = self._display_dimensions(video)
         if not video_bit_rate and duration:
             calculated = round(original_size * 8 / duration)
             audio_bit_rate = self._number(audio.get('bit_rate')) or (128_000 if audio else 0)
@@ -1108,12 +1533,127 @@ class UploadManager:
         return {
             'duration': duration if duration and duration > 0 else None,
             'durationText': self._duration_text(duration),
-            'width': self._number(video.get('width')),
-            'height': self._number(video.get('height')),
+            'width': width,
+            'height': height,
+            'isPortrait': bool(width and height and height > width),
             'videoCodec': video.get('codec_name'), 'audioCodec': audio.get('codec_name'),
             'bitRate': video_bit_rate or total_bit_rate,
             'originalSize': original_size,
         }
+
+    def _display_dimensions(self, stream):
+        width = self._number(stream.get('width'))
+        height = self._number(stream.get('height'))
+        rotation = (stream.get('tags') or {}).get('rotate')
+        if rotation is None:
+            rotation = next((item.get('rotation') for item in stream.get('side_data_list', [])
+                             if item.get('rotation') is not None), None)
+        try:
+            rotated = abs(round(float(rotation))) % 180 == 90
+        except (TypeError, ValueError, OverflowError):
+            rotated = False
+        return (height, width) if rotated else (width, height)
+
+    def _probe_image(self, source):
+        result = self._run_media_command([
+            'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+            '-show_entries', 'stream=codec_name,width,height:'
+                             'stream_tags=rotate:stream_side_data=rotation',
+            '-of', 'json', str(source),
+        ], min(self.video_timeout, 30))
+        if not result or result.returncode:
+            return {}
+        try:
+            payload = json.loads(result.stdout.decode('utf-8', errors='ignore'))
+        except (ValueError, TypeError):
+            return {}
+        stream = next(iter(payload.get('streams') or []), {})
+        width, height = self._display_dimensions(stream)
+        return {
+            'width': width,
+            'height': height,
+            'isPortrait': bool(width and height and height > width),
+            'imageFormat': stream.get('codec_name'),
+            'originalSize': source.stat().st_size,
+        }
+
+    def _compress_image(self, source):
+        config = self._image_compression_snapshot()
+        original_size = source.stat().st_size
+        details = {
+            'originalSize': original_size,
+            'processedSize': original_size,
+            'compressed': False,
+            'compressionRatio': None,
+            'warnings': [],
+        }
+        if not config['enabled'] or original_size <= config['minBytes']:
+            return details
+
+        suffix = source.suffix.lower()
+        if suffix == '.gif':
+            details['warnings'].append('GIF 动图不参与压缩，已保留原图')
+            return details
+        formats = {
+            '.jpg': ('jpg', ['-q:v', str(max(
+                2, min(31, round(31 - config['quality'] / 100 * 29))))]),
+            '.jpeg': ('jpg', ['-q:v', str(max(
+                2, min(31, round(31 - config['quality'] / 100 * 29))))]),
+            '.jpe': ('jpg', ['-q:v', str(max(
+                2, min(31, round(31 - config['quality'] / 100 * 29))))]),
+            '.jfif': ('jpg', ['-q:v', str(max(
+                2, min(31, round(31 - config['quality'] / 100 * 29))))]),
+            '.png': ('png', ['-c:v', 'png', '-compression_level', '9']),
+            '.webp': ('webp', [
+                '-c:v', 'libwebp', '-q:v', str(config['quality']),
+                '-compression_level', '4',
+            ]),
+        }
+        selected = formats.get(suffix)
+        if selected is None:
+            details['warnings'].append('当前图片格式不支持压缩，已保留原图')
+            return details
+
+        output_suffix, output_options = selected
+        temporary = source.with_name(
+            f'.image-compress-{uuid.uuid4().hex}.{output_suffix}')
+        command = [
+            'ffmpeg', '-nostdin', '-y', '-loglevel', 'error', '-i', str(source),
+            '-frames:v', '1', *output_options, str(temporary),
+        ]
+        try:
+            result = self._run_media_command(command, min(self.video_timeout, 300))
+            if (not result or result.returncode or not temporary.is_file()
+                    or temporary.stat().st_size <= 0):
+                raise OSError('ffmpeg image compression failed')
+            self.validate_file_content(temporary)
+            probe = self._probe_image(temporary)
+            if not probe.get('width') or not probe.get('height'):
+                raise OSError('compressed image validation failed')
+            processed_size = temporary.stat().st_size
+            if processed_size >= original_size:
+                details['warnings'].append('压缩后体积没有减小，已保留原图')
+                return details
+            os.replace(temporary, source)
+            details.update({
+                'processedSize': processed_size,
+                'compressed': True,
+                'compressionRatio': round(
+                    max(0, 1 - processed_size / original_size) * 100, 2),
+            })
+            return details
+        except Exception:
+            log.exception('Unable to compress uploaded image %s', source)
+            details['warnings'].append('图片压缩失败，已保留原图')
+            return details
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _process_image(self, source):
+        compression = self._compress_image(source)
+        metadata = self._probe_image(source)
+        metadata.update(compression)
+        return metadata
 
     def _compression_reasons(self, media, config=None):
         config = config or self._compression_snapshot()
@@ -1127,6 +1667,8 @@ class UploadManager:
             reasons.append('音频编码不是 AAC')
         if width > config['maxWidth'] or height > config['maxHeight']:
             reasons.append(f"分辨率超过 {config['maxWidth']}×{config['maxHeight']}")
+        if config.get('compatibilityOnly'):
+            return reasons
         large_or_long = ((media.get('originalSize') or 0) >= config['minBytes']
                          or (media.get('duration') or 0) >= config['minDuration'])
         excessive_bitrate = (media.get('bitRate') or 0) > config['maxVideoBitrate']
@@ -1214,7 +1756,7 @@ class UploadManager:
         preview = directory / 'preview_image.mp4'
         command.extend([
             '-filter_complex', ';'.join(filters), '-map', '[outv]', '-an',
-            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28',
+            '-c:v', 'libx264', '-preset', 'superfast', '-crf', '28',
             '-pix_fmt', 'yuv420p', '-movflags', '+faststart', str(preview),
         ])
         result = self._run_media_command(
@@ -1338,17 +1880,19 @@ class UploadManager:
             if not self._generate_cover(source, temporary, duration, identifier):
                 warnings.append('视频封面生成失败')
 
-            notify('generating_preview', 84, '正在生成列表悬浮预览视频')
-            self._set_stage(identifier, 'generating_preview', '正在生成列表悬浮预览视频')
-            if not self._generate_hover_preview(source, temporary, duration, identifier):
-                warnings.append('列表悬浮预览视频生成失败')
+            if config.get('generateHoverPreview'):
+                notify('generating_preview', 84, '正在生成列表悬浮预览视频')
+                self._set_stage(identifier, 'generating_preview', '正在生成列表悬浮预览视频')
+                if not self._generate_hover_preview(source, temporary, duration, identifier):
+                    warnings.append('列表悬浮预览视频生成失败')
 
-            notify('generating_vtt', 90, '正在生成播放器进度预览')
-            self._set_stage(identifier, 'generating_vtt', '正在生成播放器进度预览')
-            if not duration:
-                warnings.append('无法读取视频时长，未生成播放器进度预览')
-            elif not self._generate_vtt_preview(source, temporary, duration, identifier):
-                warnings.append('播放器进度预览生成失败')
+            if config.get('generateVttPreview'):
+                notify('generating_vtt', 90, '正在生成播放器进度预览')
+                self._set_stage(identifier, 'generating_vtt', '正在生成播放器进度预览')
+                if not duration:
+                    warnings.append('无法读取视频时长，未生成播放器进度预览')
+                elif not self._generate_vtt_preview(source, temporary, duration, identifier):
+                    warnings.append('播放器进度预览生成失败')
 
             notify('generating_preview', 96, '正在生成 3 分钟和 5 分钟预览清单')
             self._set_stage(identifier, 'generating_preview', '正在生成 3 分钟和 5 分钟预览清单')
@@ -1390,6 +1934,8 @@ class UploadManager:
     def process_preview(self, target, identifier):
         if self.preview_type(target.name) == 'video':
             return self.process_video(target, identifier)
+        if self.preview_type(target.name) == 'image':
+            return self._process_image(target)
         return {}
 
     def _source_from_metadata(self, metadata):
@@ -1433,7 +1979,9 @@ class UploadManager:
                     'previewM3u8Path': preview.get('previewM3u8Path'),
                     'preview5M3u8Path': preview.get('preview5M3u8Path'),
                     'duration': preview.get('duration'), 'width': preview.get('width'),
-                    'height': preview.get('height'), 'videoCodec': preview.get('videoCodec'),
+                    'height': preview.get('height'),
+                    'isPortrait': bool(preview.get('isPortrait')),
+                    'videoCodec': preview.get('videoCodec'),
                     'audioCodec': preview.get('audioCodec'), 'bitRate': preview.get('bitRate'),
                     'originalSize': preview.get('originalSize'),
                     'processedSize': preview.get('processedSize'),
@@ -1525,6 +2073,8 @@ class UploadManager:
                     os.replace(temporary, target)
                 now = time.time()
                 video = self.file_type(name) == 'video'
+                image_metadata = (self._process_image(target)
+                                  if self.file_type(name) == 'image' else {})
                 metadata = {
                     'identifier': identifier, 'fileName': name, 'fileType': self.file_type(name),
                     'mediaType': mimetypes.guess_type(name)[0] or 'application/octet-stream',
@@ -1532,29 +2082,36 @@ class UploadManager:
                     'completed': not video,
                     'status': 'queued' if video else 'completed',
                     'processingStage': 'queued' if video else 'completed',
-                    'message': '等待 FFmpeg 调度' if video else '上传完成', 'warnings': [],
+                    'message': '等待 FFmpeg 调度' if video else '上传完成',
+                    'warnings': image_metadata.get('warnings') or [],
                     'r2SyncEnabled': bool(r2_sync_enabled),
                     'createdAt': now, 'updatedAt': now,
                 }
+                metadata.update(image_metadata)
                 if video:
                     relative = self._video_directory(identifier).relative_to(self.files_root).as_posix()
-                    metadata.update({
+                    preview_config = self._compression_snapshot()
+                    video_paths = {
                         'sourceFile': target.relative_to(self.files_root).as_posix(),
                         'path': self.public_url(f'{relative}/index.m3u8'),
                         'hlsPath': self.public_url(f'{relative}/index.m3u8'),
                         'coverPath': self.public_url(f'{relative}/cover.jpg'),
                         'posterPath': self.public_url(f'{relative}/poster.jpg'),
-                        'previewPath': self.public_url(f'{relative}/preview_image.mp4'),
-                        'vttPath': self.public_url(f'{relative}/preview.vtt'),
                         'previewM3u8Path': self.public_url(f'{relative}/preview.m3u8'),
                         'preview5M3u8Path': self.public_url(f'{relative}/preview5.m3u8'),
-                    })
+                    }
+                    if preview_config['generateHoverPreview']:
+                        video_paths['previewPath'] = self.public_url(
+                            f'{relative}/preview_image.mp4')
+                    if preview_config['generateVttPreview']:
+                        video_paths['vttPath'] = self.public_url(f'{relative}/preview.vtt')
+                    metadata.update(video_paths)
                 else:
                     metadata.update({
                         'path': self.public_url(target.relative_to(self.files_root).as_posix()),
                         'originalDeleted': False,
                     })
-                self._save_metadata(metadata)
+                self._save_metadata(metadata, remove_chunk_cleanup=True)
                 if video:
                     self._enqueue_ffmpeg(identifier, name)
                     result = self._read_metadata(self._session(identifier))
@@ -1571,6 +2128,8 @@ class UploadManager:
                 self._remove_public_resources(identifier)
                 shutil.rmtree(self._session(identifier), ignore_errors=True)
                 with self.db() as db:
+                    db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                               (identifier,))
                     db.execute('DELETE FROM uploads WHERE identifier=?', (identifier,))
                 if isinstance(exc, OSError):
                     raise UploadError(507, 50710, '上传存储目录不可用或磁盘写入失败') from exc
@@ -1580,21 +2139,27 @@ class UploadManager:
             self._notify_completed(metadata)
             return result
 
-    def check_chunks(self, identifier):
+    def check_chunks(self, identifier, include_chunks=True):
         identifier = self.identifier(identifier)
         session = self._session(identifier)
         with self._lock(identifier):
             metadata = self._read_metadata(session)
-            chunks = self._chunk_numbers(session)
+            chunks = self._chunk_numbers(session) if include_chunks else []
+            uploaded_count = (len(chunks) if include_chunks
+                              else int(metadata.get('uploadedCount') or 0))
             total = metadata.get('totalChunks')
             completed_path = metadata.get('path')
             completed_file = self.resolve_file(completed_path) if metadata.get('completed') and completed_path else None
             completed = bool(completed_file) or bool(
                 metadata.get('completed') and metadata.get('localDeleted') and metadata.get('r2Synced'))
+            with self.db() as db:
+                cleanup = db.execute('''SELECT expires_at
+                    FROM upload_chunk_cleanup_queue WHERE identifier=?''',
+                                     (identifier,)).fetchone()
             result = {
                 'identifier': identifier,
                 'uploadedChunks': chunks,
-                'uploadedCount': len(chunks),
+                'uploadedCount': uploaded_count,
                 'totalChunks': total,
                 'completed': completed,
                 'path': completed_path if completed else None,
@@ -1612,11 +2177,13 @@ class UploadManager:
                 'r2SyncedAt': metadata.get('r2SyncedAt'),
                 'localDeleted': bool(metadata.get('localDeleted')),
                 'localDeletedAt': metadata.get('localDeletedAt'),
+                'chunkExpiresAt': cleanup['expires_at'] if cleanup else None,
                 'updatedAt': metadata.get('updatedAt'),
             }
             for field in ('coverPath', 'posterPath', 'previewPath', 'vttPath',
                           'previewM3u8Path', 'preview5M3u8Path', 'duration',
-                          'durationText', 'width', 'height', 'videoCodec', 'audioCodec',
+                          'durationText', 'width', 'height', 'isPortrait', 'imageFormat',
+                          'videoCodec', 'audioCodec',
                           'bitRate', 'originalSize', 'processedSize', 'compressed',
                           'compressionRatio'):
                 result[field] = metadata.get(field)
@@ -1635,12 +2202,12 @@ class UploadManager:
         if total_chunks is not None and chunk_number > total_chunks:
             raise UploadError(400, 40015, 'chunkNumber 不能大于 totalChunks')
         session = self._session(identifier)
-        session.mkdir(parents=True, exist_ok=True)
-        temporary = session / ('.upload-' + uuid.uuid4().hex)
-        size = self._write_upload(upload, temporary, self.max_chunk_bytes)
-        chunk_path = session / f'{chunk_number:06d}.part'
-        now = time.time()
         with self._lock(identifier):
+            session.mkdir(parents=True, exist_ok=True)
+            temporary = session / ('.upload-' + uuid.uuid4().hex)
+            size = self._write_upload(upload, temporary, self.max_chunk_bytes)
+            chunk_path = session / f'{chunk_number:06d}.part'
+            now = time.time()
             metadata = self._read_metadata(session)
             completed_path = metadata.get('path') if metadata.get('completed') else None
             completed_file = self.resolve_file(completed_path) if completed_path else None
@@ -1660,9 +2227,13 @@ class UploadManager:
             if previous_total and total_chunks and previous_total != total_chunks:
                 temporary.unlink(missing_ok=True)
                 raise UploadError(409, 40910, 'totalChunks 与已有上传记录不一致')
+            previous_size = chunk_path.stat().st_size if chunk_path.is_file() else 0
             os.replace(temporary, chunk_path)
+            with self._config_lock:
+                expires_at = now + int(self.chunk_retention_days) * 86400
             metadata.update({
                 'identifier': identifier,
+                'size': max(0, int(metadata.get('size') or 0) - previous_size + size),
                 'totalChunks': total_chunks or previous_total,
                 'uploadedCount': len(self._chunk_numbers(session)),
                 'completed': False,
@@ -1673,8 +2244,9 @@ class UploadManager:
                 'createdAt': metadata.get('createdAt') or now,
                 'updatedAt': now,
             })
-            self._save_metadata(metadata)
+            self._save_metadata(metadata, chunk_expiry=expires_at)
             uploaded = self._chunk_numbers(session)
+            self._chunk_cleanup_wakeup.set()
         return {
             'identifier': identifier,
             'chunkNumber': chunk_number,
@@ -1724,14 +2296,18 @@ class UploadManager:
             primary_path = self.public_url(predicted_target.relative_to(self.files_root).as_posix())
             hls_path = primary_path if video else None
             video_relative = self._video_directory(identifier).relative_to(self.files_root).as_posix()
+            preview_config = self._compression_snapshot()
             predicted = ({
                 'coverPath': self.public_url(f'{video_relative}/cover.jpg'),
                 'posterPath': self.public_url(f'{video_relative}/poster.jpg'),
-                'previewPath': self.public_url(f'{video_relative}/preview_image.mp4'),
-                'vttPath': self.public_url(f'{video_relative}/preview.vtt'),
                 'previewM3u8Path': self.public_url(f'{video_relative}/preview.m3u8'),
                 'preview5M3u8Path': self.public_url(f'{video_relative}/preview5.m3u8'),
             } if video else {})
+            if video and preview_config['generateHoverPreview']:
+                predicted['previewPath'] = self.public_url(
+                    f'{video_relative}/preview_image.mp4')
+            if video and preview_config['generateVttPreview']:
+                predicted['vttPath'] = self.public_url(f'{video_relative}/preview.vtt')
             metadata.update({
                 'identifier': identifier, 'fileName': file_name, 'totalChunks': total_chunks,
                 'fileType': file_type,
@@ -1744,7 +2320,7 @@ class UploadManager:
                 'createdAt': metadata.get('createdAt') or now, 'updatedAt': now,
             })
             metadata.update(predicted)
-            self._save_metadata(metadata)
+            self._save_metadata(metadata, remove_chunk_cleanup=True)
             with self._guard:
                 future = self._merge_futures.get(identifier)
                 if not future or future.done():
@@ -1756,6 +2332,7 @@ class UploadManager:
                 'processingStage': 'merging', 'completed': False,
                 'path': primary_path, 'hlsPath': hls_path,
                 'fileType': file_type,
+                'isPortrait': bool(metadata.get('isPortrait')),
                 'previewType': 'video' if video else self.preview_type(file_name),
                 'message': metadata['message'], 'warnings': [],
             }
@@ -1886,6 +2463,8 @@ class UploadManager:
                 'duration': preview.get('duration'),
                 'durationText': preview.get('durationText'),
                 'width': preview.get('width'), 'height': preview.get('height'),
+                'isPortrait': bool(preview.get('isPortrait')),
+                'imageFormat': preview.get('imageFormat'),
                 'videoCodec': preview.get('videoCodec'),
                 'audioCodec': preview.get('audioCodec'), 'bitRate': preview.get('bitRate'),
                 'originalSize': preview.get('originalSize'),
@@ -1958,29 +2537,25 @@ class UploadManager:
     def list_uploads(self, page=1, page_size=20, keyword=None, file_type=None, status=None):
         conditions, values = [], []
         if keyword:
-            terms = {str(keyword).strip()}
+            keyword = str(keyword).strip()
+            relative = self._relative_file(keyword)
+            parts = Path(relative).parts if relative else ()
+            identifier = None
+            if parts and parts[0] == 'video' and len(parts) >= 4:
+                identifier = parts[3]
+            elif parts and parts[0] in {'image', 'other'} and len(parts) == 4:
+                identifier = parts[3].split('.', 1)[0]
             try:
-                parsed = urlsplit(str(keyword).strip())
-                if parsed.path:
-                    terms.add(parsed.path)
-                    decoded_path = unquote(parsed.path)
-                    terms.add(decoded_path)
-                    terms.add(quote(decoded_path, safe='/'))
-            except ValueError:
-                pass
-            terms.discard('')
-            fields = (
-                'identifier', 'file_name', 'path', 'hls_path', 'cover_path',
-                'poster_path', 'preview_path', 'vtt_path',
-                'preview_m3u8_path', 'preview5_m3u8_path',
-            )
-            searches = []
-            for term in terms:
-                escaped = term.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
-                for field in fields:
-                    searches.append(f"{field} LIKE ? ESCAPE '\\'")
-                    values.append(f'%{escaped}%')
-            conditions.append('(' + ' OR '.join(searches) + ')')
+                identifier = self.identifier(identifier) if identifier else None
+            except UploadError:
+                identifier = None
+            if identifier:
+                conditions.append('identifier=?')
+                values.append(identifier)
+            else:
+                escaped = keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+                conditions.append("(identifier=? OR file_name LIKE ? ESCAPE '\\')")
+                values.extend((keyword, f'%{escaped}%'))
         if file_type:
             conditions.append('file_type=?')
             values.append(file_type)
@@ -1991,7 +2566,7 @@ class UploadManager:
         with self.db() as db:
             total = db.execute('SELECT count(*) FROM uploads' + clause, values).fetchone()[0]
             rows = db.execute('SELECT * FROM uploads' + clause
-                              + ' ORDER BY updated DESC,identifier DESC LIMIT ? OFFSET ?',
+                              + ' ORDER BY created DESC LIMIT ? OFFSET ?',
                               (*values, page_size, (page - 1) * page_size)).fetchall()
         items = []
         for row in rows:
@@ -2028,6 +2603,8 @@ class UploadManager:
                     deleted_paths.append('source')
             with self.db() as db:
                 db.execute('DELETE FROM ffmpeg_tasks WHERE upload_identifier=?', (identifier,))
+                db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                           (identifier,))
                 cursor = db.execute('DELETE FROM uploads WHERE identifier=?', (identifier,))
                 if cursor.rowcount:
                     deleted_paths.append('record')
@@ -2054,6 +2631,8 @@ class UploadManager:
                         shutil.rmtree(self._session(identifier), ignore_errors=True)
                         with self.db() as db:
                             db.execute('DELETE FROM ffmpeg_tasks WHERE upload_identifier=?', (identifier,))
+                            db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                                       (identifier,))
                             db.execute('DELETE FROM uploads WHERE identifier=?', (identifier,))
                     deleted.append(supplied)
                 except OSError:
@@ -2068,6 +2647,8 @@ class UploadManager:
                         shutil.rmtree(session)
                         with self.db() as db:
                             db.execute('DELETE FROM ffmpeg_tasks WHERE upload_identifier=?', (identifier,))
+                            db.execute('DELETE FROM upload_chunk_cleanup_queue WHERE identifier=?',
+                                       (identifier,))
                             db.execute('DELETE FROM uploads WHERE identifier=?', (identifier,))
                         deleted.append(supplied)
                     else:

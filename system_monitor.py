@@ -13,6 +13,8 @@ log = logging.getLogger(__name__)
 
 class SystemMonitor:
     RETENTION_SECONDS = 3 * 24 * 3600
+    MAX_RETRY_SECONDS = 60
+    ERROR_LOG_INTERVAL = 60
 
     def __init__(self, download_root, database, runtime_provider=None):
         self.download_root = Path(download_root).resolve()
@@ -254,12 +256,29 @@ class SystemMonitor:
                 self._last_cleanup = now
 
     def _run(self):
-        while not self._closed.wait(self.interval):
+        failures = 0
+        retry_delay = 0
+        last_error_log = 0.0
+        while not self._closed.wait(retry_delay or self.interval):
             try:
                 self._sample()
-            except Exception:
+            except Exception as exc:
                 # Monitoring must never interrupt downloads or API service startup.
-                log.exception('System metrics sampling failed')
+                failures += 1
+                retry_delay = min(
+                    self.MAX_RETRY_SECONDS,
+                    self.interval * (2 ** min(failures - 1, 6)))
+                now = time.monotonic()
+                if failures == 1 or now - last_error_log >= self.ERROR_LOG_INTERVAL:
+                    log.warning(
+                        'System metrics sampling unavailable; retrying in %ss: %s',
+                        retry_delay, exc)
+                    last_error_log = now
+            else:
+                if failures:
+                    log.info('System metrics sampling recovered after %s failures', failures)
+                failures = 0
+                retry_delay = 0
 
     def current(self):
         with self._lock:

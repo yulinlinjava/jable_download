@@ -4,10 +4,12 @@ import { DocumentCopy } from '@element-plus/icons-vue'
 import chunkUploadExample from '../examples/chunk-upload.js?raw'
 import vueUploadExample from '../examples/chunk-upload-vue.vue?raw'
 import javaProxyExample from '../examples/upload-proxy.java?raw'
+import yulinlinJavaProxyExample from '../examples/upload-proxy-yulinlin.java?raw'
 import phpProxyExample from '../examples/upload-proxy.php?raw'
 
 const endpoints = [
   { method: 'POST', path: '/api/bigFileUploads（PHP 兼容入口）', description: '兼容旧 Vue 的 chunk、filename、chunkNumber、totalChunks 协议；最后一个分片自动提交 merge' },
+  { method: 'POST', path: '/upload/image、/upload/video（Java 兼容入口）', description: '兼容 appId、requestId、size、index、file 协议；由 Java 转发层换成本项目参数' },
   { method: 'GET', path: '/upload/chunk?identifier=...', description: '查询已上传分片、后台处理状态和最终资源地址' },
   { method: 'POST', path: '/upload/chunk', description: 'multipart/form-data 上传一个分片，分片编号从 1 开始' },
   { method: 'POST', path: '/upload/merge', description: '提交异步合并任务；视频会继续生成 HLS、封面和预览资源' },
@@ -51,7 +53,8 @@ async function copyExample(content = vueUploadExample, label = 'Vue 3') {
         <ul>
           <li>Vue 直连时配置上传服务地址和 <code>X-API-Key</code>，浏览器直接请求 <code>/upload/*</code>。</li>
           <li>Java/PHP 接收浏览器参数和文件流，向真正的上传服务补充 <code>X-API-Key</code>。PHP 还提供 <code>/api/bigFileUploads</code> 兼容入口，可直接接收旧 Vue 客户端的字段；它使用首片前 16 KiB、文件名和总分片数生成 16 位 ID，并在最后一片后自动提交合并。</li>
-          <li>采用服务器转发时，客户端仍负责计算 <code>identifier</code>；转发层不重新计算，查询、上传和合并始终使用同一个值。</li>
+          <li>现有 Java 的 <code>UploadFilePo</code> 可继续使用：<code>requestId</code> 生成稳定的 16 位资源 ID，<code>size</code> 映射为总分片数，<code>index</code> 映射为分片编号；默认按从 0 开始的下标转换。</li>
+          <li>标准转发接口由客户端计算 <code>identifier</code>。旧 PHP 协议会根据首片生成 ID；现有 Java 协议则根据 <code>appId + requestId</code> 生成稳定的 16 位 ID，查询、上传和合并始终复用该值。</li>
           <li>Java 示例使用临时文件和 <code>FileSystemResource</code>，文件不会整体进入 Java 堆，也不会发生输入流被预读后无法再次读取。</li>
         </ul>
       </section>
@@ -101,11 +104,13 @@ async function copyExample(content = vueUploadExample, label = 'Vue 3') {
           <el-descriptions-item label="previewPath">列表鼠标悬浮预览 MP4</el-descriptions-item>
           <el-descriptions-item label="vttPath">播放器进度缩略图 VTT</el-descriptions-item>
           <el-descriptions-item label="duration / durationText">视频时长秒数及格式化时长</el-descriptions-item>
-          <el-descriptions-item label="width / height">原视频宽度和高度</el-descriptions-item>
+          <el-descriptions-item label="width / height">图片或视频的显示宽度和高度</el-descriptions-item>
+          <el-descriptions-item label="isPortrait">是否竖屏；只有高度大于宽度时为 true</el-descriptions-item>
+          <el-descriptions-item label="imageFormat">图片编码格式，例如 mjpeg、png、webp</el-descriptions-item>
           <el-descriptions-item label="videoCodec / audioCodec">原视频和音频编码</el-descriptions-item>
           <el-descriptions-item label="bitRate">检测到的视频码率，单位 bps</el-descriptions-item>
-          <el-descriptions-item label="originalSize / processedSize">原文件及最终 TS 分片总字节数</el-descriptions-item>
-          <el-descriptions-item label="compressed / compressionRatio">是否转码及体积减少百分比</el-descriptions-item>
+          <el-descriptions-item label="originalSize / processedSize">原文件及最终文件字节数；视频为 TS 总大小</el-descriptions-item>
+          <el-descriptions-item label="compressed / compressionRatio">是否压缩及体积减少百分比</el-descriptions-item>
         </el-descriptions>
       </section>
 
@@ -119,6 +124,10 @@ async function copyExample(content = vueUploadExample, label = 'Vue 3') {
           <el-tab-pane label="Java 转发">
             <div class="code-heading"><p>Spring Boot 3.2+，服务端配置目标地址和密钥，multipart 使用可重复读取的临时文件。</p><el-button :icon="DocumentCopy" @click="copyExample(javaProxyExample, 'Java')">复制代码</el-button></div>
             <pre class="code-block"><code>{{javaProxyExample}}</code></pre>
+          </el-tab-pane>
+          <el-tab-pane label="Java现有接口兼容">
+            <div class="code-heading"><p>保留原 <code>/upload/image</code>、<code>/upload/video</code> 和 <code>UploadFilePo</code> 参数，由服务端转换协议并隐藏 API Key。</p><el-button :icon="DocumentCopy" @click="copyExample(yulinlinJavaProxyExample, 'Java现有接口兼容')">复制代码</el-button></div>
+            <pre class="code-block"><code>{{yulinlinJavaProxyExample}}</code></pre>
           </el-tab-pane>
           <el-tab-pane label="PHP 转发">
             <div class="code-heading"><p>原生 PHP cURL，可放在 PHP-FPM 站点中；同时兼容标准 <code>/upload/*</code> 和旧客户端 <code>/api/bigFileUploads</code>。</p><el-button :icon="DocumentCopy" @click="copyExample(phpProxyExample, 'PHP')">复制代码</el-button></div>

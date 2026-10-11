@@ -13,6 +13,7 @@ let player: Plyr | undefined
 let hls: Hls | undefined
 let loadSequence = 0
 const fallbackPoster = "data:image/svg+xml;charset=UTF-8," + encodeURIComponent(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900"><rect width="1600" height="900" fill="#111827"/><circle cx="800" cy="420" r="96" fill="#6366f1"/><path d="M775 365v110l90-55z" fill="white"/><text x="800" y="590" text-anchor="middle" fill="#a5b4fc" font-family="sans-serif" font-size="42">${props.task.title || props.task.video_id}</text></svg>`)
+const allowLocalFallback = props.task.r2_sync_status !== 'synced' && !props.task.r2_synced
 const mediaUrl = (value?: string) => value || ''
 const chapters = computed(() => props.task.chapters?.length ? props.task.chapters : [{
   index: 1, title: '第 1 章', status: props.task.status,
@@ -40,9 +41,9 @@ async function loadChapter(index: number, autoplay = true, fallback = false) {
   chapterLoading.value = true
   chapterError.value = ''
   clearMedia()
-  const vtt = mediaUrl(fallback ? chapter.fallback_vtt_url : chapter.vtt_url)
+  const vtt = mediaUrl(fallback && allowLocalFallback ? chapter.fallback_vtt_url : chapter.vtt_url)
   player.setPreviewThumbnails({ enabled: Boolean(vtt), src: vtt })
-  const stream = fallback
+  const stream = fallback && allowLocalFallback
     ? (mediaUrl(chapter.fallback_m3u8_url) || mediaUrl(props.task.fallback_m3u8_url))
     : (mediaUrl(chapter.m3u8_url) || mediaUrl(props.task.m3u8_url) || `/api/download/${props.task.task_id}/files/index.m3u8`)
   if (!stream) {
@@ -62,7 +63,7 @@ async function loadChapter(index: number, autoplay = true, fallback = false) {
     })
     hls.on(Hls.Events.ERROR, (_event, data) => {
       if (sequence !== loadSequence || !data.fatal) return
-      if (!fallback && (chapter.fallback_m3u8_url || props.task.fallback_m3u8_url)) {
+      if (allowLocalFallback && !fallback && (chapter.fallback_m3u8_url || props.task.fallback_m3u8_url)) {
         loadChapter(index, autoplay, true)
         return
       }
@@ -79,7 +80,7 @@ async function loadChapter(index: number, autoplay = true, fallback = false) {
     }
     const failed = () => {
       if (sequence !== loadSequence) return
-      if (!fallback && (chapter.fallback_m3u8_url || props.task.fallback_m3u8_url)) {
+      if (allowLocalFallback && !fallback && (chapter.fallback_m3u8_url || props.task.fallback_m3u8_url)) {
         loadChapter(index, autoplay, true)
         return
       }
@@ -104,7 +105,7 @@ onMounted(async () => {
     poster,
     previewThumbnails: { enabled: false, src: '' },
   })
-  if (props.task.fallback_cover_url && poster !== props.task.fallback_cover_url) {
+  if (allowLocalFallback && props.task.fallback_cover_url && poster !== props.task.fallback_cover_url) {
     const probe = new Image()
     probe.onerror = () => {
       if (!video.value || !player) return
@@ -132,6 +133,7 @@ onBeforeUnmount(() => { loadSequence += 1; clearMedia(); player?.destroy() })
       </div>
       <div v-if="chapterError" class="chapter-error">{{chapterError}}</div>
     </div>
+    <div v-if="chapters.length <= 1 && chapterError" class="chapter-error">{{chapterError}}</div>
   </div>
 </template>
 
